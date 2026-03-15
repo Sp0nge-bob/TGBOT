@@ -8,6 +8,8 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+import tempfile
+import shutil
 import datetime
 import json
 import os
@@ -94,11 +96,18 @@ def load_users():
         return {}
 
 def save_users(users):
-    """Сохраняет весь словарь пользователей в файл без потерь данных"""
     try:
-        save_json_file(USER_FILE, users)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
+            json.dump(users, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        
+        # Атомарная замена
+        shutil.move(tmp.name, USER_FILE)
     except Exception as e:
-        logger.error(f"Ошибка сохранения пользователей: {e}")
+        logger.error(f"Ошибка атомарного сохранения users: {e}")
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
 
 # Инициализация хранилища
 user_store = load_users()
