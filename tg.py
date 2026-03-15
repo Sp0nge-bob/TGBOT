@@ -123,8 +123,6 @@ def update_user_activity(user_id: int, username: str | None):
     user_store[uid]["username"] = username or user_store[uid].get("username", "без ника")
     user_store[uid]["last_activity"] = time.time()
 
-    save_users(user_store)
-
 def add_user(uid, username):
     if uid not in user_store:
         user_store[uid] = username or "без ника"
@@ -139,6 +137,14 @@ def register_user_from_message(msg):
 
 groups: dict[str, dict] = load_json_file(GROUPS_FILE)
 
+async def periodic_save():
+    while True:
+        await asyncio.sleep(600) # 10 минут
+        try:
+            save_users(user_store)
+            logger.info("💾 Автосохранение пользователей выполнено")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при плановом сохранении: {e}")
 # ----------------- SELECTION STORAGE -----------------
 def load_selections():
     global selected_course_per_chat, selected_group_per_chat
@@ -652,19 +658,10 @@ async def send_or_edit_text(text, chat_id, reply_message=None):
 
 # ----------------- SHOW WEEK -----------------
 async def handle_show_week(message, wk, reply_message):
-
     chat_id = message.chat.id
-
-    global _shared_session
-    session = _shared_session
-    if session is None:
-        async with aiohttp.ClientSession() as tmp_s:
-            html = await get_cached_page(tmp_s, build_url_for_wk(wk, chat_id))
-    else:
-        html = await get_cached_page(session, build_url_for_wk(wk, chat_id))
+    html = await get_cached_page(_shared_session, build_url_for_wk(wk, chat_id))
 
     text = parse_schedule_pretty(html)
-
     group = selected_group_per_chat.get(chat_id, "не выбрана")
     text = f"👤 <b>Ваша группа:</b> {group}\n\n{text}"
 
@@ -1143,17 +1140,30 @@ async def main():
     global _shared_session
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     _shared_session = aiohttp.ClientSession(connector=connector)
+    
+    # Запуск фоновых задач
     asyncio.create_task(schedule_sender())
+    asyncio.create_task(periodic_save())
+    
     try:
         await dp.start_polling(bot)
     finally:
-        # закрыть сессию сохранить кеш
+        logger.info("🛑 Завершение работы. Очистка ресурсов...")
+        
+        # 1. Закрываем сессию (отдельный try, чтобы не мешать сохранению)
         try:
             if _shared_session:
                 await _shared_session.close()
         except Exception as e:
-            logger.warning("Error closing session: %s", e)
-        _save_cache_file()
+            logger.warning("Ошибка при закрытии сессии: %s", e)
+
+        # 2. Финальное сохранение всех данных
+        try:
+            save_users(user_store)
+            _save_cache_file()
+            logger.info("💾 Все данные успешно сохранены на диск!")
+        except Exception as e:
+            logger.error("Критическая ошибка при финальном сохранении: %s", e)
 
 if __name__ == "__main__":
     asyncio.run(main())
