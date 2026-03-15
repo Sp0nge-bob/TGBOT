@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+venv/
+*.pkl
+backups/
+page_cache.pkl
+push.sh
+selections.json
+users.json
