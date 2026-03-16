@@ -16,7 +16,7 @@ import os
 import logging
 import pickle
 import time  # used for cache timestamps
-from collections import OrderedDict  # added for LRU locks
+from collections import OrderedDict, Counter  # added for LRU locks
 
 # ----------------- CONFIG -----------------
 load_dotenv("/root/TGBOT/.env") # файл .env с записанным токеном, путь к файлу
@@ -44,10 +44,14 @@ logger = logging.getLogger(__name__)
 # ----------------- STATE -----------------
 bot = Bot(TOKEN)
 dp = Dispatcher()
+START_TIME = time.time()
+TOTAL_REQUESTS = 0
 
 class UserActivityMiddleware:
     async def __call__(self, handler, event, data):
-        # event может быть Message или CallbackQuery
+        global TOTAL_REQUESTS
+        TOTAL_REQUESTS += 1
+        
         if hasattr(event, "from_user") and event.from_user is not None:
             update_user_activity(
                 event.from_user.id,
@@ -828,6 +832,66 @@ async def ask_schedule_time(cb: CallbackQuery):
     await cb.message.answer(text, parse_mode=ParseMode.HTML)
 
 # ----------------- TRIGGER COMMANDS -----------------
+@dp.message(Command("stats"))
+async def show_stats(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+
+    # 1. Время работы бота (аптайм)
+    uptime_seconds = int(time.time() - START_TIME)
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+
+    # 2. Размер кеша страниц
+    cache_size = len(_cache)
+
+    # 3. Всего юзеров
+    total_users = len(user_store)
+
+    # 4. Наиболее популярная группа
+    if selected_group_per_chat:
+        most_popular_group, group_count = Counter(selected_group_per_chat.values()).most_common(1)[0]
+    else:
+        most_popular_group, group_count = "Нет данных", 0
+
+    # 5. Всего запросов
+    total_reqs = TOTAL_REQUESTS
+
+    # 6. Последнее использование (исключая владельца)
+    last_user_name = "Нет данных"
+    last_time = 0
+    
+    for uid_str, info in user_store.items():
+        if int(uid_str) == BOT_OWNER_ID:
+            continue
+            
+        user_time = info.get("last_activity", 0)
+        if user_time > last_time:
+            last_time = user_time
+            last_user_name = info.get("username", "без_ника")
+
+    if last_time > 0:
+        last_time_str = datetime.datetime.fromtimestamp(last_time).strftime('%d.%m.%Y %H:%M:%S')
+        last_use_text = f"@{last_user_name} ({last_time_str})"
+    else:
+        last_use_text = "Никто еще не пользовался"
+
+    # 7. Количество подключенных рассылок
+    active_schedules = sum(1 for info in user_store.values() if "schedule_time" in info)
+
+    # Формируем итоговое сообщение
+    text = (
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"⏱ <b>Время работы:</b> {uptime_str}\n"
+        f"📦 <b>Размер кеша:</b> {cache_size} стр.\n"
+        f"👥 <b>Всего юзеров:</b> {total_users}\n"
+        f"🏆 <b>Популярная группа:</b> {most_popular_group} ({group_count} чел.)\n"
+        f"📈 <b>Всего запросов:</b> {total_reqs}\n"
+        f"👤 <b>Последний активный:</b> {last_use_text}\n"
+        f"🔔 <b>Подключено рассылок:</b> {active_schedules}\n"
+    )
+    
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
 @dp.message(Command("list_users"))
 async def list_users(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
