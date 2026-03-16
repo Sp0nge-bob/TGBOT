@@ -38,8 +38,23 @@ MAX_CACHE_AGE_DAYS = 1 #Время хранения кеша в бекапе
 LOCKS_CACHE_MAX = 1000  # URL локи
 
 # ----------------- LOGGING -----------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from logging.handlers import RotatingFileHandler
+
+logger = logging.getLogger("TGBot")
+logger.setLevel(logging.INFO)
+
+# Формат: Дата | Уровень | Файл:Строка | Сообщение
+formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(filename)s:%(lineno)d | %(message)s')
+
+# 1. Хэндлер для записи в файл (макс 5 МБ, храним 5 старых копий)
+file_handler = RotatingFileHandler('bot_log.log', maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# 2. Хэндлер для вывода в консоль
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 # ----------------- STATE -----------------
 bot = Bot(TOKEN)
@@ -51,7 +66,7 @@ class UserActivityMiddleware:
     async def __call__(self, handler, event, data):
         global TOTAL_REQUESTS
         TOTAL_REQUESTS += 1
-        
+        logger.info(f"👤 Юзер {event.from_user.id} (@{event.from_user.username}) -> действие: {type(event).__name__}")
         if hasattr(event, "from_user") and event.from_user is not None:
             update_user_activity(
                 event.from_user.id,
@@ -454,11 +469,24 @@ async def schedule_sender():
 
 # ----------------- FETCH (basic) -----------------
 async def fetch_page_once(session, url):
+    start_time = time.perf_counter() # Засекаем время
     try:
         async with session.get(url, timeout=10) as r:
-            return await r.text()
+            status = r.status
+            content = await r.text()
+            duration = time.perf_counter() - start_time
+            
+            if status == 200:
+                logger.info(f"🌐 [HTTP 200] OK за {duration:.2f}s | URL: {url}")
+            else:
+                logger.warning(f"⚠️ [HTTP {status}] Нетипичный ответ за {duration:.2f}s | URL: {url}")
+                
+            return content
+    except asyncio.TimeoutError:
+        logger.error(f"🕒 Timeout! Сайт не ответил за 10с | URL: {url}")
+        return ""
     except Exception as e:
-        logger.debug("fetch_page_once error for %s: %s", url, e)
+        logger.error(f"❌ Ошибка запроса: {type(e).__name__}: {e} | URL: {url}")
         return ""
 
 # ----------------- CACHE -----------------
@@ -1204,6 +1232,7 @@ async def forward_messages(message: Message):
 
 # ----------------- RUN -----------------
 async def main():
+    logger.info("🚀 Бот запускается...")
     global _shared_session
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     _shared_session = aiohttp.ClientSession(connector=connector)

@@ -9,3 +9,4 @@ push.sh
 selections.json
 users.json
 rollback.sh
+bot_log.log
