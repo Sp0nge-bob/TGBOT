@@ -849,7 +849,7 @@ async def list_users(message: Message):
     await message.answer("📋 Сохранённые пользователи:\n\n" + "\n".join(lines))
 
 # словарь: user_id -> target_id (кому пересылать)
-active_trolls: dict[int, int] = {}
+active_supp: dict[int, int] = {}
 
 @dp.message(Command("broadcast"))
 async def broadcast(message: Message):
@@ -887,8 +887,8 @@ async def broadcast(message: Message):
         f"Ошибок: {failed}"
     )
 
-@dp.message(Command("troll_to"))
-async def start_troll(message: Message):
+@dp.message(Command("supp_to"))
+async def start_supp(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
 
@@ -908,7 +908,7 @@ async def start_troll(message: Message):
         args = message.text.split(maxsplit=1)
 
         if len(args) < 2:
-            await message.answer("Использование: /troll_to user_id")
+            await message.answer("Использование: /supp_to user_id")
             return
 
         try:
@@ -923,17 +923,17 @@ async def start_troll(message: Message):
         await message.answer("Такого пользователя нет")
         return
 
-    active_trolls[message.from_user.id] = int(target_id)
+    active_supp[message.from_user.id] = int(target_id)
 
-    await message.answer(f"🎯 Троллинг включён → {target_id}")
+    await message.answer(f"🎯 Переписка с → {target_id}")
 
-@dp.message(Command("troll_stop"))
-async def troll_stop(message: Message):
-    if message.from_user.id in active_trolls:
-        del active_trolls[message.from_user.id]
-        await message.answer("Троллинг остановлен")
+@dp.message(Command("supp_stop"))
+async def supp_stop(message: Message):
+    if message.from_user.id in active_supp:
+        del active_supp[message.from_user.id]
+        await message.answer("Переписка остановлена")
     else:
-        await message.answer("Троллинг не активен")
+        await message.answer("Переписка не активна")
 
 @dp.message(Command("debug_week"))
 async def debug_week(message: Message):
@@ -1012,7 +1012,7 @@ async def schedule_input(message: Message):
 
 # ----------------- UNIVERSAL FORWARD -----------------
 @dp.message()
-async def forward_messages(message: Message): #хенлдер пересылки сообщений
+async def forward_messages(message: Message):
     update_user_activity(message.from_user.id, message.from_user.username)
 # --- OWNER REPLY MODE ---
     if message.from_user.id == BOT_OWNER_ID and message.reply_to_message:
@@ -1058,9 +1058,9 @@ async def forward_messages(message: Message): #хенлдер пересылки
 
             return
 
-    # ----------------- TROLL MODE -----------------
-    if message.from_user.id in active_trolls:
-        target_id = active_trolls[message.from_user.id]
+    # ----------------- SUPPORT MODE -----------------
+    if message.from_user.id in active_supp:
+        target_id = active_supp[message.from_user.id]
 
         try:
             if message.text:
@@ -1092,11 +1092,10 @@ async def forward_messages(message: Message): #хенлдер пересылки
         except Exception as e:
             await message.answer(f"⚠️ Ошибка при пересылке: {e}")
 
-        return  # чтобы сообщение не пошло дальше в обычный forward
+        return
 
-    # ----------------- FORWARD REPLIES -----------------
     if message.from_user.id == BOT_OWNER_ID:
-        return  # не пересылать свои сообщения
+        return
 
     chat_id = BOT_OWNER_ID
     user_info = f"От @{message.from_user.username} ({message.from_user.id})"
@@ -1154,7 +1153,7 @@ async def main():
     finally:
         logger.info("🛑 Завершение работы. Очистка ресурсов...")
         
-        # 1. Закрываем сессию (отдельный try, чтобы не мешать сохранению)
+        # 1. Закрываем сессию
         try:
             if _shared_session:
                 await _shared_session.close()
