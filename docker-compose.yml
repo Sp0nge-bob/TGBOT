@@ -1,0 +1,10 @@
+services:
+  tg-bot:
+    build: .
+    container_name: tg-bot
+    restart: unless-stopped
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python tg.py
