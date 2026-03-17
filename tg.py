@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, F
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BotCommand, BotCommandScopeDefault
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
@@ -97,12 +98,29 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# ----------------- STATE -----------------
+# ----------------- STATE ----------------------
 bot = Bot(TOKEN)
 dp = Dispatcher()
 dp.callback_query.middleware(CallbackAntiFloodMiddleware())
 START_TIME = time.time()
 TOTAL_REQUESTS = 0
+
+# ----------------- БОТ МЕНЮ -------------------
+async def set_bot_commands():
+    commands = [
+        BotCommand(command="start",     description="Начать / выбрать группу"),
+        BotCommand(command="today",  description="Расписание на сегодня"),
+        BotCommand(command="week",      description="Расписание на эту неделю"),
+    ]
+
+    try:
+        await bot.set_my_commands(
+            commands=commands,
+            scope=BotCommandScopeDefault()
+        )
+        logger.info("✅ Команды бота успешно установлены")
+    except Exception as e:
+        logger.error(f"Не удалось установить команды бота: {e}")
 
 class UserActivityMiddleware:
     async def __call__(self, handler, event, data):
@@ -750,7 +768,7 @@ async def handle_show_week(message, wk, reply_message):
 
     await send_or_edit_text(text, chat_id)
 
-# ----------------- START -----------------
+# ----------------- БОТ КОМАНДЫ -----------------
 @dp.message(Command("start"))
 async def start(message: Message):
     register_user_from_message(message)
@@ -767,6 +785,67 @@ async def start(message: Message):
         parse_mode=ParseMode.HTML,
         reply_markup=make_inline_kb()
     )
+
+@dp.message(Command("schedule", "today"))
+async def cmd_schedule_today(message: Message):
+    chat_id = message.chat.id
+    group = selected_group_per_chat.get(chat_id)
+    
+    if not group:
+        await message.answer("⚠️ Сначала выбери группу командой /start")
+        return
+
+    wk = await get_current_wk()
+    current_wk_per_chat[chat_id] = wk
+
+    url = build_url_for_wk(wk, chat_id)
+    html = await get_cached_page(_shared_session, url)
+    
+    week_text = parse_schedule_pretty(html)
+    today_text = extract_today(week_text)
+
+    text = f"👤 <b>Ваша группа:</b> {group}\n\n{today_text}"
+
+    # Отправляем + сохраняем для кнопок «обновить / неделя»
+    msg = await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_inline_kb()
+    )
+    
+    last_msg_per_chat[chat_id] = msg.message_id
+    last_text_per_chat[chat_id] = text
+
+
+@dp.message(Command("week"))
+async def cmd_week(message: Message):
+    chat_id = message.chat.id
+    group = selected_group_per_chat.get(chat_id)
+    
+    if not group:
+        await message.answer("⚠️ Сначала выбери группу командой /start")
+        return
+
+    wk = await get_current_wk()
+    current_wk_per_chat[chat_id] = wk
+
+    url = build_url_for_wk(wk, chat_id)
+    html = await get_cached_page(_shared_session, url)
+    
+    week_text = parse_schedule_pretty(html)
+
+    text = f"👤 <b>Ваша группа:</b> {group}\n\n{week_text}"
+
+    # Отправляем + сохраняем для кнопок
+    msg = await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_inline_kb()
+    )
+    
+    last_msg_per_chat[chat_id] = msg.message_id
+    last_text_per_chat[chat_id] = text
+
 # ----------------- GROUP MENU -----------------
 @dp.callback_query(F.data == "change_group")
 async def change_group(cb: CallbackQuery):
@@ -832,6 +911,41 @@ async def select_group(cb: CallbackQuery):
     current_wk_per_chat[chat_id] = wk
 
     await handle_show_week(cb.message, wk, cb.message)
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КОМАНД ====================
+
+async def get_today_schedule_text(chat_id: int) -> str:
+    """Возвращает красивое расписание ТОЛЬКО на сегодня"""
+    group = selected_group_per_chat.get(chat_id)
+    if not group:
+        return "⚠️ Сначала выбери группу командой /start"
+
+    url = build_url_for_wk(None, chat_id)                    # текущая неделя
+    html = await get_cached_page(_shared_session, url)       # ← ИСПРАВЛЕНО!
+    
+    if not html:
+        return "❌ Не удалось загрузить расписание"
+
+    week_text = parse_schedule_pretty(html)
+    today_text = extract_today(week_text)
+
+    return f"👤 <b>Ваша группа:</b> {group}\n\n{today_text}"
+
+
+async def get_week_schedule_text(chat_id: int) -> str:
+    """Возвращает полное расписание на неделю"""
+    group = selected_group_per_chat.get(chat_id)
+    if not group:
+        return "⚠️ Сначала выбери группу командой /start"
+
+    url = build_url_for_wk(None, chat_id)
+    html = await get_cached_page(_shared_session, url)       # ← ИСПРАВЛЕНО!
+    
+    if not html:
+        return "❌ Не удалось загрузить расписание"
+
+    week_text = parse_schedule_pretty(html)
+    return f"👤 <b>Ваша группа:</b> {group}\n\n{week_text}"
 
 # ----------------- WEEK BUTTONS -----------------
 @dp.callback_query(F.data.startswith("wk_"))
@@ -1415,7 +1529,9 @@ async def main():
     global _shared_session
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     _shared_session = aiohttp.ClientSession(connector=connector)
-    
+
+    await set_bot_commands()
+
     # Запуск фоновых задач
     asyncio.create_task(schedule_sender())
     asyncio.create_task(periodic_save())
