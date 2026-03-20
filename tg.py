@@ -235,6 +235,38 @@ async def periodic_save():
         except Exception as e:
             logger.error(f"❌ Ошибка при плановом сохранении: {e}")
 # ----------------- SELECTION STORAGE -----------------
+def _load_cache_file():
+    global _cache, CURRENT_WK_CACHE
+    if not os.path.exists(CACHE_FILE):
+        _cache = {}
+        return
+    try:
+        with open(CACHE_FILE, "rb") as f:
+            data = pickle.load(f)
+        _cache = data.get("page_cache", {})
+        CURRENT_WK_CACHE = data.get("wk_cache", CURRENT_WK_CACHE)
+
+        cutoff = time.time() - (MAX_CACHE_AGE_DAYS * 86400)
+        old = [k for k, (ts, _) in _cache.items() if ts < cutoff]
+        for k in old:
+            del _cache[k]
+        if old:
+            logger.info(f"🧹 Кеш: удалено {len(old)} старых записей (> {MAX_CACHE_AGE_DAYS} дней)")
+    except Exception as e:
+        logger.warning(f"⚠️ Кеш не загрузился: {e}")
+        _cache = {}
+
+def _save_cache_file():
+    try:
+        data = {"page_cache": _cache, "wk_cache": CURRENT_WK_CACHE}
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tmp:
+            pickle.dump(data, tmp)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        shutil.move(tmp.name, CACHE_FILE)
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения кеша: {e}")
+
 def load_selections():
     global selected_course_per_chat, selected_group_per_chat
     data = load_json_file(SELECTION_FILE)
@@ -1775,8 +1807,28 @@ async def forward_worker():
 async def main():
     logger.info("🚀 Бот запускается...")
     global _shared_session
-    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
-    _shared_session = aiohttp.ClientSession(connector=connector)
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=20)
+    connector = aiohttp.TCPConnector(
+        limit=100,                    # общий лимит соединений
+        limit_per_host=10,             # максимум 5 одновременных к lk.ks.psuti.ru
+        ttl_dns_cache=300,
+        force_close=False,
+        enable_cleanup_closed=True    # предотвращает утечки сокетов
+    )
+    headers = {
+        "User-Agent": "KS-Psuti-TGBot/2.0 (Python/aiohttp)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9"
+    }
+    global _shared_session
+    _shared_session = aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers=headers
+    )
+    logger.info("🌐 Глобальная сессия создана (limit_per_host=10 + User-Agent)")
+
+    _load_cache_file()
+    logger.info(f"📦 Кеш загружен: {len(_cache)} записей | wk={CURRENT_WK_CACHE['wk']}")
 
     await set_bot_commands()
 
