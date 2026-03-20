@@ -19,7 +19,7 @@ import os
 import logging
 import pickle
 import time  # used for cache timestamps
-from collections import OrderedDict, Counter  # added for LRU locks
+from collections import deque, OrderedDict, Counter, defaultdict
 
 # ----------------- CONFIG -----------------
 load_dotenv("/root/TGBOT/.env") # файл .env с записанным токеном, путь к файлу
@@ -145,6 +145,7 @@ dp.callback_query.middleware(UserActivityMiddleware())
 current_wk_per_chat: dict[int, int] = {}
 last_msg_per_chat: dict[int, int] = {}
 last_text_per_chat: dict[int, str] = {}
+forward_queue: asyncio.Queue = asyncio.Queue()
 
 locks: dict[int, asyncio.Lock] = {}
 
@@ -571,75 +572,65 @@ async def schedule_sender():
             now_str = now_dt.strftime("%H:%M")
             today_iso = datetime.date.today().isoformat()
 
-            # Проверяем, есть ли вообще кому рассылать сегодня
             active_users = [uid for uid, info in user_store.items() if info.get("schedule_time") == now_str]
-            has_active_today = bool(active_users)
+            if active_users:
+                logger.info(f"🔄 Рассылка: {len(active_users)} активных в {now_str}")
 
-            if has_active_today:
-                logger.info(f"🔄 Рассылка: проверка в {now_str} (активных: {len(active_users)})")
-
+            wk = await get_current_wk()
             sent_count = 0
-            for uid_str, info in list(user_store.items()):
-                target_time = info.get("schedule_time")
-                if not target_time or target_time != now_str:
-                    continue
 
-                if info.get("last_sent_date") == today_iso:
-                    logger.info(f"⏭️ Пользователь {uid_str}: уже отправлено сегодня")
-                    continue
-
+            # === ГРУППИРОВКА: один fetch + parse на группу ===
+            url_to_uids: dict[str, list[str]] = defaultdict(list)
+            for uid_str in active_users:
                 uid_int = int(uid_str)
-
-                if uid_int not in selected_group_per_chat:
-                    logger.warning(f"⚠️ Пользователь {uid_int}: группа не выбрана")
+                grp = selected_group_per_chat.get(uid_int)
+                if not grp or grp not in groups:
                     continue
+                obj = groups[grp]["obj"]
+                url = f"https://lk.ks.psuti.ru/?mn=2&obj={obj}&wk={wk}"
+                url_to_uids[url].append(uid_str)
 
-                logger.info(f"📨 Рассылка для {uid_int} (@{info.get('username')}) в {now_str}")
-
-                wk = await get_current_wk()
-                url = build_url_for_wk(wk, uid_int)
-
+            for url, uid_list in url_to_uids.items():
                 async with _shared_session.get(url, timeout=15) as resp:
                     html = await resp.text()
-
                 week_text = parse_schedule_pretty(html)
                 today_text = extract_today(week_text)
-                group = selected_group_per_chat.get(uid_int, "не выбрана")
 
-                msg_text = (
-                    f"👤 <b>Ваша группа:</b> {group}\n"
-                    f"🔔 <b>Расписание на сегодня ({now_str})</b>\n\n"
-                    f"{today_text}"
-                )
+                for uid_str in uid_list:
+                    uid_int = int(uid_str)
+                    info = user_store[uid_str]
+                    if info.get("last_sent_date") == today_iso:
+                        continue
 
-                try:
-                    sent_msg = await bot.send_message(
-                        uid_int,
-                        msg_text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=make_inline_kb()
+                    group_name = selected_group_per_chat.get(uid_int, "не выбрана")
+                    msg_text = (
+                        f"👤 <b>Ваша группа:</b> {group_name}\n"
+                        f"🔔 <b>Расписание на сегодня ({now_str})</b>\n\n"
+                        f"{today_text}"
                     )
-                    last_msg_per_chat[uid_int] = sent_msg.message_id
-                    last_text_per_chat[uid_int] = msg_text
 
-                    sent_count += 1
-                    logger.info(f"✅ Отправлено пользователю {uid_int} (с клавиатурой)")
+                    try:
+                        sent_msg = await bot.send_message(
+                            uid_int, msg_text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=make_inline_kb()
+                        )
+                        last_msg_per_chat[uid_int] = sent_msg.message_id
+                        last_text_per_chat[uid_int] = msg_text
+                        sent_count += 1
 
-                    user_store[uid_str]["last_sent_time"] = now_str
-                except Exception as send_err:
-                    logger.error(f"❌ Не удалось отправить рассылку {uid_int}: {send_err}")
-                    continue
+                        info["last_sent_time"] = now_str
+                        info["last_sent_date"] = today_iso
+                    except Exception as e:
+                        logger.error(f"❌ Рассылка {uid_int}: {e}")
 
-                user_store[uid_str]["last_sent_date"] = today_iso
+            if sent_count > 0:
                 save_users(user_store)
-
-            if sent_count > 0 or has_active_today:
-                logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count} сообщений")
+                logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count}")
 
         except Exception as e:
-            logger.error(f"❌ Критическая ошибка в цикле рассылки: {type(e).__name__}: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка рассылки: {type(e).__name__}: {e}", exc_info=True)
 
-        # Спим до начала следующей минуты
         await asyncio.sleep(60 - datetime.datetime.now().second)
 
 # ----------------- FETCH (basic) -----------------
@@ -1669,7 +1660,7 @@ async def forward_messages(message: Message):
             return
 
         if message.text:
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_message,
                 (chat_id,),
                 {"text": "💬 " + user_info + ":\n" + message.text}
@@ -1678,7 +1669,7 @@ async def forward_messages(message: Message):
         elif message.photo:
             photo = message.photo[-1].file_id
             caption = "🖼️ " + user_info + ":\n" + (message.caption or "")
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_photo,
                 (chat_id,),
                 {"photo": photo, "caption": caption}
@@ -1687,7 +1678,7 @@ async def forward_messages(message: Message):
         elif message.document:
             doc = message.document.file_id
             caption = "📄 " + user_info + ":\n" + (message.caption or "")
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_document,
                 (chat_id,),
                 {"document": doc, "caption": caption}
@@ -1696,19 +1687,19 @@ async def forward_messages(message: Message):
         elif message.video:
             video = message.video.file_id
             caption = "🎥 " + user_info + ":\n" + (message.caption or "")
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_video,
                 (chat_id,),
                 {"video": video, "caption": caption}
             ))
 
         elif message.video_note:
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_message,
                 (chat_id,),
                 {"text": f"🎬 {user_info}"}
             ))
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_video_note,
                 (chat_id,),
                 {
@@ -1719,47 +1710,47 @@ async def forward_messages(message: Message):
             ))
 
         elif message.audio:
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_audio,
                 (chat_id,),
                 {"audio": message.audio.file_id, "caption": "🎵 " + user_info}
             ))
 
         elif message.voice:
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_voice,
                 (chat_id,),
                 {"voice": message.voice.file_id, "caption": "🎙️ " + user_info}
             ))
 
         elif message.sticker:
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_message,
                 (chat_id,),
                 {"text": f"⭐ {user_info}: стикер"}
             ))
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_sticker,
                 (chat_id,),
                 {"sticker": message.sticker.file_id}
             ))
 
         elif message.animation:
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_animation,
                 (chat_id,),
                 {"animation": message.animation.file_id, "caption": "🎞️ " + user_info}
             ))
 
         else:
-            forward_queue.append((
+            await forward_queue.put((
                 bot.send_message,
                 (chat_id,),
                 {"text": f"❓ Неподдерживаемый тип сообщения от {message.from_user.id}"}
             ))
 
     except Exception as e:
-        forward_queue.append((
+        await forward_queue.put((
             bot.send_message,
             (chat_id,),
             {"text": f"⚠️ Ошибка при пересылке от {message.from_user.id}: {e}"}
@@ -1767,21 +1758,18 @@ async def forward_messages(message: Message):
 
 async def forward_worker():
     while True:
-        if forward_queue:
-            func, args, kwargs = forward_queue.popleft()
-
-            try:
-                await func(*args, **kwargs)
-                await asyncio.sleep(0.5)
-
-            except Exception as e:
-                if "retry after" in str(e).lower():
-                    await asyncio.sleep(3)
-                    forward_queue.appendleft((func, args, kwargs))
-                else:
-                    logger.error(f"Ошибка пересылки: {e}")
-        else:
-            await asyncio.sleep(0.1)
+        func, args, kwargs = await forward_queue.get()
+        try:
+            await func(*args, **kwargs)
+            await asyncio.sleep(0.05)  # антифлуд
+        except Exception as e:
+            if "retry after" in str(e).lower():
+                await asyncio.sleep(3)
+                await forward_queue.put((func, args, kwargs))
+            else:
+                logger.error(f"Ошибка пересылки: {e}")
+        finally:
+            forward_queue.task_done()
 
 # ----------------- RUN -----------------
 async def main():
