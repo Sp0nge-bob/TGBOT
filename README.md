@@ -38,8 +38,7 @@ OWNERID=твой Telegram ID (для админ-команд)
 
 ### 🐳 Docker (рекомендуется)
 
-~~
-bash
+```bash
 git clone https://github.com/Sp0nge-bob/TGBOT
 cd TGBOT
 
@@ -47,14 +46,13 @@ cp .env.example .env
 nano .env
 
 docker compose up -d --build
-~~
+```
 
 ---
 
 ### 🐍 Python
 
-~~
-bash
+```bash
 git clone https://github.com/Sp0nge-bob/TGBOT
 cd TGBOT
 
@@ -67,7 +65,7 @@ cp .env.example .env
 nano .env
 
 python tg.py
-~~
+```
 
 ---
 
