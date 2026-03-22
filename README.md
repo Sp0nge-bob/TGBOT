@@ -26,11 +26,10 @@
 
 Создай `.env` файл на основе `.env.example`:
 
-~~
-nano .env
+```.env
 RELEASE_TOKEN=токен бота (через @botfather)
 OWNERID=твой Telegram ID (для админ-команд)
-~~
+```
 
 ---
 
