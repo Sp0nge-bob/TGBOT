@@ -106,5 +106,5 @@ python tg.py
 - Найден баг с некорректным обновлением недели. Причины пока не выявлены.  
   Исправляется добавлением в crontab перезапуск бота каждый понедельник в 00:00 для переопределения недели  
   Вместо /root/TGBOT/restart.log укажите свой путь куда будут сохраняться логи перезапуска  
-  `0 0 * * 1 echo "=== Перезапуск бота $(date '+%Y-%m-%d %H:%M:%S') ===" >> /root/TGBOT/restart.log 2>&1`
-  `0 0 * * 1 sleep 3 && cd /root/TGBOT && docker compose restart >> /root/TGBOT/restart.log 2>&1`
+  `0 0 * * 1 echo "=== Перезапуск бота $(date '+%Y-%m-%d %H:%M:%S') ===" >> /root/TGBOT/restart.log 2>&1`  
+  `0 0 * * 1 sleep 3 && cd /root/TGBOT && docker compose restart >> /root/TGBOT/restart.log 2>&1`  
