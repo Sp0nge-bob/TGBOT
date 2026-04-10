@@ -25,6 +25,7 @@ from collections import deque, OrderedDict, Counter, defaultdict
 # ----------------- CONFIG -----------------
 load_dotenv("/root/TGBOT/.env") # файл .env с записанным токеном, путь к файлу
 TOKEN = os.getenv("RELEASE_TOKEN") # внутри .env RELEASE_TOKEN=токен бота
+PROXY_URL = os.getenv("PROXY_URL") # Загружаем прокси из .env
 BASE_URL = "https://lk.ks.psuti.ru/?mn=2&obj=218"
 BOT_OWNER_ID = int(os.getenv("OWNERID")) #ID ТГ Аккаунта
 USER_FILE = "users.json" #Куда сохраняются пользователи
@@ -107,7 +108,17 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 # ----------------- STATE ----------------------
-bot = Bot(TOKEN)
+from aiogram.client.session.aiohttp import AiohttpSession
+
+if PROXY_URL:
+    # Создаем сессию с прокси только для Телеграма (aiogram)
+    bot_session = AiohttpSession(proxy=PROXY_URL)
+    bot = Bot(token=TOKEN, session=bot_session)
+    logger.info(f"🌐 Бот инициализирован через прокси: {PROXY_URL.split('@')[-1] if '@' in PROXY_URL else PROXY_URL}")
+else:
+    # Если прокси не указан, работаем как обычно
+    bot = Bot(token=TOKEN)
+
 dp = Dispatcher()
 dp.callback_query.middleware(CallbackAntiFloodMiddleware())
 START_TIME = time.time()
@@ -620,7 +631,6 @@ def has_classes_today(week_text: str) -> bool:
     today_text = extract_today(week_text)
     # Отправляем ВСЕГДА, если блок дня есть
     return len(today_text.strip()) > 10 and "не найден" not in today_text.lower()
-
 async def schedule_sender():
     while True:
         try:
