@@ -39,6 +39,7 @@ CALLBACK_DELAY = 1.0  # Настройка антифлуда на кнопки
 forward_queue = deque()
 user_message_cooldown = {}
 USER_DELAY = 1.0  # Антифлуд на сообщения от одного юзера
+LK_LIMIT_PER_HOST = 10 #Максимальное количество одновременных TCP-соединений
 
 # CACHE config
 CACHE_TTL_SECONDS = 300  # TTL Кеша
@@ -48,6 +49,17 @@ MAX_CACHE_AGE_DAYS = 1 #Время хранения кеша в бекапе
 
 # LOCKS LRU config
 LOCKS_CACHE_MAX = 1000  # URL локи
+
+async def get_outgoing_ip(session: aiohttp.ClientSession) -> str:
+    """Определяет реальный выходной IP (работает и с прокси, и без)"""
+    try:
+        async with session.get("https://api.ipify.org?format=text", timeout=10) as resp:
+            if resp.status == 200:
+                ip = (await resp.text()).strip()
+                return ip
+    except Exception:
+        pass
+    return "не удалось определить"
 
 #-------------------АНТИФЛУД------------------------------
 def is_flood(user_id: int) -> bool:
@@ -1974,25 +1986,34 @@ async def main():
     logger.info("🚀 Бот запускается...")
     global _shared_session
     timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=20)
+
     connector = aiohttp.TCPConnector(
-        limit=100,                    # общий лимит соединений
-        limit_per_host=10,             # максимум 5 одновременных к lk.ks.psuti.ru
+        limit=100,
+        limit_per_host=LK_LIMIT_PER_HOST,   # используем переменную
         ttl_dns_cache=300,
         force_close=False,
-        enable_cleanup_closed=True    # предотвращает утечки сокетов
+        enable_cleanup_closed=True
     )
+
     headers = {
         "User-Agent": "KS-Psuti-TGBot/2.0 (Python/aiohttp)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9"
     }
+
     global _shared_session
     _shared_session = aiohttp.ClientSession(
         connector=connector,
         timeout=timeout,
         headers=headers
     )
-    logger.info("🏛️ [LK PSUTI] Сессия создана: ПРЯМОЕ подключение (Russian IP)")
-    logger.info("🌐 Глобальная сессия создана (limit_per_host=10 + User-Agent)")
+
+    # Динамический лог с реальным значением лимита
+    logger.info(f"🏛️ [LK PSUTI] Сессия создана: ПРЯМОЕ подключение (без прокси)")
+    logger.info(f"🌐 Глобальная сессия создана (limit_per_host={LK_LIMIT_PER_HOST} + User-Agent)")
+
+    outgoing_ip = await get_outgoing_ip(_shared_session)
+    logger.info(f"🌍 Выходной IP для lk.ks.psuti.ru: {outgoing_ip}")
+
     _load_cache_file()
     actual_wk = await get_current_wk() 
     await set_bot_commands()
