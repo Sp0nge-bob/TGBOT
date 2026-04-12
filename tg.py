@@ -62,20 +62,34 @@ def is_flood(user_id: int) -> bool:
 
 class CallbackAntiFloodMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        if hasattr(event, "from_user"):
-            user_id = event.from_user.id
+        if not hasattr(event, "from_user") or not hasattr(event, "answer"):
+            return await handler(event, data)
 
-            if is_flood(user_id):
-                if hasattr(event, "answer"):
-                    await event.answer("Лелеле тише ковбой")
-                return
+        user_id = event.from_user.id
 
+        if is_flood(user_id):
+            try:
+                # Пытаемся ответить тихо, но игнорируем ошибки "query is too old"
+                await event.answer("Лелеле тише ковбой", show_alert=False)
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e).lower() or "response timeout expired" in str(e).lower():
+                    logger.warning(f"⚠️ Старый callback от юзера {user_id} (игнорируем)")
+                else:
+                    logger.warning(f"⚠️ Ошибка при answer в антифлуде: {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Неизвестная ошибка в антифлуде: {e}")
+            return  # Важно: прерываем обработку
+
+        # Нормальный путь
         try:
             return await handler(event, data)
         except TelegramBadRequest as e:
             if "query is too old" in str(e).lower() or "response timeout expired" in str(e).lower():
                 logger.warning(f"⚠️ Старый callback от юзера {user_id} (игнорируем)")
                 return
+            raise  # Пробрасываем другие ошибки
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка в обработчике callback: {e}")
             raise
 
 def is_user_spamming(user_id: int) -> bool:
