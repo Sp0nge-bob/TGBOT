@@ -99,6 +99,7 @@ python tg.py
 
 ```env
 PROXY_URL=socks5://user:password@host:port
+```
 
 ---
 
