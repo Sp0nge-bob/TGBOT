@@ -114,10 +114,10 @@ if PROXY_URL:
     # Создаем сессию с прокси только для Телеграма (aiogram)
     bot_session = AiohttpSession(proxy=PROXY_URL)
     bot = Bot(token=TOKEN, session=bot_session)
-    logger.info(f"🌐 Бот инициализирован через прокси: {PROXY_URL.split('@')[-1] if '@' in PROXY_URL else PROXY_URL}")
+    logger.info(f"📡 [TELEGRAM API] Работа через PROXY: {PROXY_URL.split('@')[-1] if '@' in PROXY_URL else PROXY_URL}")
 else:
-    # Если прокси не указан, работаем как обычно
     bot = Bot(token=TOKEN)
+    logger.info("📡 [TELEGRAM API] Работа напрямую (без прокси)")
 
 dp = Dispatcher()
 dp.callback_query.middleware(CallbackAntiFloodMiddleware())
@@ -733,24 +733,24 @@ async def schedule_sender():
 
 # ----------------- FETCH (basic) -----------------
 async def fetch_page_once(session, url):
-    start_time = time.perf_counter() # Засекаем время
+    start_time = time.perf_counter()
     try:
+        # Логируем направление запроса
+        logger.info(f"🔎 [DIRECT FETCH] Запрос к ПГУТИ: {url}")
+        
         async with session.get(url, timeout=10) as r:
             status = r.status
             content = await r.text()
             duration = time.perf_counter() - start_time
             
             if status == 200:
-                logger.info(f"🌐 [HTTP 200] OK за {duration:.2f}s | URL: {url}")
+                logger.info(f"✅ [HTTP 200] Получено напрямую за {duration:.2f}s")
             else:
-                logger.warning(f"⚠️ [HTTP {status}] Нетипичный ответ за {duration:.2f}s | URL: {url}")
+                logger.warning(f"⚠️ [HTTP {status}] Ошибка при прямом запросе")
                 
             return content
-    except asyncio.TimeoutError:
-        logger.error(f"🕒 Timeout! Сайт не ответил за 10с | URL: {url}")
-        return ""
     except Exception as e:
-        logger.error(f"❌ Ошибка запроса: {type(e).__name__}: {e} | URL: {url}")
+        logger.error(f"❌ [FETCH ERROR] Прямое соединение не удалось: {type(e).__name__}")
         return ""
 
 # ----------------- CACHE -----------------
@@ -1977,6 +1977,7 @@ async def main():
         timeout=timeout,
         headers=headers
     )
+    logger.info("🏛️ [LK PSUTI] Сессия создана: ПРЯМОЕ подключение (Russian IP)")
     logger.info("🌐 Глобальная сессия создана (limit_per_host=10 + User-Agent)")
     _load_cache_file()
     actual_wk = await get_current_wk() 
