@@ -1,44 +1,136 @@
-import aiohttp
+# parser.py
+from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup
-import asyncio
-import json
-#ПАРСИТ ГРУППЫ И ОСТАВЛЯЕТ ПРОПУСКИ ЧТОБ ЗАПОЛНИТЬ КУРС (ХЗ МБ ПЕРЕДЕЛАЮ)
-BASE_URL = "https://lk.ks.psuti.ru/?mn=2"
-OUTPUT_FILE = "groups.json"
+import re
 
-async def fetch_page(session: aiohttp.ClientSession, url: str) -> str:
-    async with session.get(url, timeout=10) as resp:
-        resp.raise_for_status()
-        return await resp.text()
+# ====================== НАСТРОЙКА ======================
+# ← Здесь меняй название парсера для логов
+PARSER_NAME = "ПГУТИ Парсер"        # ← ← ← ТВОЁ НАЗВАНИЕ
+# Примеры:
+# PARSER_NAME = "КС ПГУТИ"
+# PARSER_NAME = "lk.ks.psuti.ru Parser v2"
+# PARSER_NAME = "My Custom Parser"
 
-async def parse_groups() -> dict[str, dict]:
-    async with aiohttp.ClientSession() as session:
-        html = await fetch_page(session, BASE_URL)
+
+class ScheduleParser(ABC):
+    """Базовый класс для всех парсеров"""
+    
+    @abstractmethod
+    def parse_schedule(self, html: str) -> str:
+        pass
+
+    @abstractmethod
+    def extract_current_week(self, html: str) -> int:
+        pass
+
+    def get_name(self) -> str:
+        """Возвращает имя парсера для логов"""
+        return PARSER_NAME
+
+
+class PsutiScheduleParser(ScheduleParser):
+    """Парсер для lk.ks.psuti.ru"""
+
+    def parse_schedule(self, html: str) -> str:
+        if not html or not html.strip():
+            return "⚠️ Расписание не загрузилось"
+
         soup = BeautifulSoup(html, "html.parser")
-        groups = {}
+        result = []
+        last_day = None
 
-        # ищем все ссылки вида ?mn=2&obj=XXX
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "mn=2" in href and "obj=" in href:
-                try:
-                    obj = int(href.split("obj=")[1].split("&")[0])
-                    name = a.get_text(strip=True)
-                    groups[name] = {"obj": obj, "course": ""}  # оставляем поле course пустым
-                except Exception:
+        for tr in soup.find_all("tr"):
+            h3 = tr.find("h3")
+            if h3:
+                day = " ".join(h3.get_text(" ", strip=True).split())
+                if any(word in day.lower() for word in ["предыдущая", "выберите", "курс:"]):
                     continue
-        return groups
+                if day != last_day:
+                    if result:
+                        result.append("\n")
+                    result.append(f"📅 <b>{day}</b>\n")
+                    last_day = day
+                continue
 
-async def main():
-    groups = await parse_groups()
-    print(f"Найдено групп: {len(groups)}")
-    for name, data in groups.items():
-        print(f"{name} -> {data['obj']}")
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 7 or not tds[0].get_text(strip=True).isdigit():
+                continue
 
-    # сохраняем в файл
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(groups, f, ensure_ascii=False, indent=2)
-    print(f"Группы сохранены в {OUTPUT_FILE}")
+            num = tds[0].get_text(strip=True)
+            time_str = " ".join(tds[1].stripped_strings).strip()
+            way = tds[2].get_text(strip=True).strip()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+            disc_td = tds[3]
+            disc_text = disc_td.get_text(" ", strip=True)
+            is_replacement = bool(disc_td.find("a", class_="t_zm") or "Замена" in disc_text)
+
+            disc_parts = [line.strip() for line in disc_td.stripped_strings if line.strip()]
+            discipline = disc_parts[0] if disc_parts else "Нет данных"
+            teacher = disc_parts[1] if len(disc_parts) > 1 else ""
+            location = " ".join(disc_parts[2:]).replace("Кабинет:", "🚪 Кабинет:") if len(disc_parts) > 2 else ""
+
+            theme = " ".join(tds[4].stripped_strings).strip()
+            resource = " ".join(tds[5].stripped_strings).strip()
+            task = " ".join(tds[6].stripped_strings).strip()
+
+            pair_lines = [f"▫️ <b>{num}</b> | {time_str}"]
+            if way:
+                pair_lines.append(f"   <i>{way}</i>")
+            pair_lines.append(f"   📚 {discipline}")
+            if is_replacement:
+                pair_lines.append("   <i>(замена)</i>")
+            if teacher:
+                pair_lines.append(f"   👤 {teacher}")
+            if location:
+                if "🚪" in location:
+                    addr, cab = location.split("🚪", 1)
+                    pair_lines.append(f"   🏢 {addr.strip()}")
+                    pair_lines.append(f"   🚪{cab.strip()}")
+                else:
+                    pair_lines.append(f"   🏢 {location}")
+            if theme:
+                pair_lines.append(f"   📌 <i>{theme}</i>")
+            if resource:
+                pair_lines.append(f"   🔗 {resource}")
+            if task:
+                pair_lines.append(f"   📝 {task}")
+
+            result.append("\n".join(pair_lines))
+            result.append("")
+
+        return "\n".join(result).strip() or "Нет пар на эту неделю"
+
+    def extract_current_week(self, html: str) -> int:
+        # Основной способ — из ссылки "следующая неделя"
+        next_match = re.search(r'следующая неделя.*?wk=(\d+)', html, re.IGNORECASE | re.DOTALL)
+        if next_match:
+            return int(next_match.group(1)) - 1
+
+        prev_match = re.search(r'предыдущая неделя.*?wk=(\d+)', html, re.IGNORECASE | re.DOTALL)
+        if prev_match:
+            return int(prev_match.group(1)) + 1
+
+        all_wk = re.findall(r'wk=(\d+)', html)
+        if all_wk:
+            return max(int(w) for w in all_wk)
+
+        small_match = re.search(r'(\d+)\s*неделя', html, re.IGNORECASE)
+        if small_match:
+            return int(small_match.group(1))
+
+        return 0
+
+
+# ====================== ФАБРИКА ======================
+def get_parser() -> ScheduleParser:
+    """Возвращает активный парсер"""
+    return PsutiScheduleParser()
+
+
+# ====================== СОВМЕСТИМОСТЬ ======================
+def parse_schedule_pretty(html: str) -> str:
+    return get_parser().parse_schedule(html)
+
+
+def get_current_week_from_html(html: str) -> int:
+    return get_parser().extract_current_week(html)

@@ -20,7 +20,7 @@ import os
 import logging
 import pickle
 import time  # used for cache timestamps
-from parser import parse_schedule_pretty, get_current_week_from_html, get_parser
+from parser import parse_schedule_pretty, get_current_week_from_html
 from collections import deque, OrderedDict, Counter, defaultdict
 
 # ----------------- CONFIG -----------------
@@ -701,11 +701,10 @@ def _save_cache_file():
 
 # ----------------- АВТООПРЕДЕЛЕНИЕ НЕДЕЛИ -----------------
 async def get_current_wk() -> int:
-    """Определение текущей недели полностью через парсер."""
     global CURRENT_WK_CACHE
     now = time.time()
 
-    # Кэш (1 час)
+    # Кэш (1 час) — оставляем как было, только парсинг делегируем
     if CURRENT_WK_CACHE["wk"] != 0 and now - CURRENT_WK_CACHE["ts"] < 3600:
         return CURRENT_WK_CACHE["wk"]
 
@@ -719,15 +718,13 @@ async def get_current_wk() -> int:
         logger.error(f"get_current_wk: ошибка запроса BASE_URL → {e}")
         return CURRENT_WK_CACHE["wk"] or 0
 
-    # Получаем неделю и имя парсера
+    # ← ВСЯ логика недели теперь в парсере
     wk = get_current_week_from_html(html)
-    parser = get_parser()           # ← теперь импортировано
-    parser_name = parser.get_name()
 
     CURRENT_WK_CACHE = {"wk": wk, "ts": now}
-    _save_cache_file()
+    _save_cache_file()  # сохраняем в бэкап
 
-    logger.info(f"🔄 Определена текущая неделя: {wk} (через {parser_name})")
+    logger.info(f"🔄 Определена текущая неделя: {wk} (через PsutiScheduleParser)")
     return wk
 
 def _get_lock_for_url(url: str) -> asyncio.Lock:
