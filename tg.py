@@ -534,6 +534,7 @@ def has_classes_today(week_text: str) -> bool:
     today_text = extract_today(week_text)
     # Отправляем ВСЕГДА, если блок дня есть
     return len(today_text.strip()) > 10 and "не найден" not in today_text.lower()
+
 async def schedule_sender():
     while True:
         try:
@@ -566,23 +567,33 @@ async def schedule_sender():
                 url_to_uids[url].append(uid_str)
 
             sent_count = 0
-            sent_this_run = set()  # защита от двойного счёта
+            sent_this_run = set()
 
             for url, uid_list in url_to_uids.items():
-                # Убираем возможные дубли (на всякий случай)
-                unique_uids = list(dict.fromkeys(uid_list))  # сохраняет порядок
+                unique_uids = list(dict.fromkeys(uid_list))
 
-                async with _shared_session.get(url, timeout=15) as resp:
-                    html = await resp.text()
+                # ПРАВКА: Добавлена проверка HTTP статуса
+                try:
+                    async with _shared_session.get(url, timeout=30) as resp:
+                        if resp.status != 200:
+                            logger.warning(f"⚠️ HTTP {resp.status} при загрузке расписания для {url}")
+                            continue
+                        html = await resp.text()
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при загрузке расписания: {e}")
+                    continue
 
                 # Парсим один раз на группу
                 week_text = parse_schedule_pretty(html)
                 today_text = extract_today(week_text)
 
-                # Пропускаем всю группу, если нет занятий
+                # ПРАВКА: Проверяем результат парсинга
                 lower_text = today_text.lower()
-                if "занятий нет" in lower_text or "день не найден" in lower_text or "сегодня занятий нет" in lower_text:
-                    logger.info(f"⏭️ Пропуск группы ({len(unique_uids)} чел.) — нет занятий сегодня")
+                if ("занятий нет" in lower_text or 
+                    "день не найден" in lower_text or 
+                    "сегодня занятий нет" in lower_text or
+                    "расписание не загрузилось" in lower_text):
+                    logger.info(f"⏭️ Пропуск группы ({len(unique_uids)} чел.) — нет занятий сегодня или ошибка загрузки")
                     continue
 
                 logger.info(f"📨 Отправляем группе ({len(unique_uids)} чел.): {url}")
@@ -594,7 +605,7 @@ async def schedule_sender():
                         continue
 
                     if uid_int in sent_this_run:
-                        continue  # защита от двойной отправки
+                        continue
 
                     group_name = selected_group_per_chat.get(uid_int, "не выбрана")
                     msg_text = (
@@ -618,12 +629,11 @@ async def schedule_sender():
                         info["last_sent_time"] = now_str
                         info["last_sent_date"] = today_iso
 
-                        logger.debug(f"✅ Отправлено {uid_int} (sent_count = {sent_count})")
+                        logger.debug(f"✅ Отправлено {uid_int}")
 
                     except Exception as e:
                         logger.error(f"❌ Рассылка {uid_int}: {e}")
 
-            # Сохраняем только если что-то отправили
             if sent_count > 0:
                 save_users(user_store)
                 logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count}")
@@ -631,7 +641,6 @@ async def schedule_sender():
         except Exception as e:
             logger.error(f"❌ Критическая ошибка в schedule_sender: {type(e).__name__}: {e}", exc_info=True)
 
-        # Ждём ровно до следующей минуты
         await asyncio.sleep(60 - datetime.datetime.now().second)
 
 # ----------------- FETCH (basic) -----------------
@@ -679,7 +688,7 @@ def _clean_old_cache():
 
 # ----------------- АВТООПРЕДЕЛЕНИЕ НЕДЕЛИ -----------------
 async def get_current_wk() -> int:
-    """Определение текущей недели полностью через парсер."""
+    """Определение текущей недели с устойчивостью к ошибкам."""
     global CURRENT_WK_CACHE
     now = time.time()
 
@@ -687,26 +696,50 @@ async def get_current_wk() -> int:
     if CURRENT_WK_CACHE["wk"] != 0 and now - CURRENT_WK_CACHE["ts"] < 3600:
         return CURRENT_WK_CACHE["wk"]
 
-    try:
-        async with _shared_session.get(BASE_URL, timeout=10) as resp:
-            if resp.status != 200:
-                logger.warning(f"get_current_wk: статус {resp.status}")
-                return CURRENT_WK_CACHE["wk"] or 0
-            html = await resp.text()
-    except Exception as e:
-        logger.error(f"get_current_wk: ошибка запроса BASE_URL → {e}")
-        return CURRENT_WK_CACHE["wk"] or 0
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with _shared_session.get(BASE_URL, timeout=30) as resp:
+                if resp.status != 200:
+                    logger.warning(f"⚠️ get_current_wk: HTTP {resp.status} (попытка {attempt+1}/{max_retries})")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                
+                html = await resp.text()
+            
+            # Получаем неделю и имя парсера
+            wk = get_current_week_from_html(html)
+            parser = get_parser()
+            parser_name = parser.get_name()
 
-    # Получаем неделю и имя парсера
-    wk = get_current_week_from_html(html)
-    parser = get_parser()           # ← теперь импортировано
-    parser_name = parser.get_name()
+            if wk > 0:
+                CURRENT_WK_CACHE = {"wk": wk, "ts": now}
+                _save_cache_file()
+                logger.info(f"✅ Определена неделя: {wk} (через {parser_name})")
+                return wk
+            
+            logger.warning(f"⚠️ get_current_wk: неделю не определить (попытка {attempt+1}/{max_retries})")
+            await asyncio.sleep(2 ** attempt)
+            
+        except asyncio.TimeoutError:
+            logger.error(f"❌ get_current_wk: TIMEOUT (попытка {attempt+1}/{max_retries})")
+            await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            logger.error(f"❌ get_current_wk: ошибка (попытка {attempt+1}/{max_retries}): {type(e).__name__}: {e}")
+            await asyncio.sleep(2 ** attempt)
 
-    CURRENT_WK_CACHE = {"wk": wk, "ts": now}
-    _save_cache_file()
+    # Если всё не сработало — критическая ошибка
+    logger.critical("🚨 КРИТИЧЕСКАЯ ОШИБКА: Невозможно определить текущую неделю после 3 попыток!")
+    
+    # Возвращаем последний известный результат или выбрасываем исключение
+    if CURRENT_WK_CACHE["wk"] > 0:
+        logger.warning(f"⚠️ Использую последнее известное значение: неделя {CURRENT_WK_CACHE['wk']}")
+        return CURRENT_WK_CACHE["wk"]
+    
+    # Если совсем нет информации — критическая ошибка
+    raise RuntimeError("Cannot determine current week after 3 attempts. Check PGUTI site access.")
 
-    logger.info(f"🔄 Определена текущая неделя: {wk} (через {parser_name})")
-    return wk
+
 
 def _get_lock_for_url(url: str) -> asyncio.Lock:
     lock = _locks_per_url.pop(url, None)
@@ -1817,11 +1850,11 @@ async def forward_worker():
 async def main():
     logger.info("🚀 Бот запускается...")
     global _shared_session
-    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=20)
+    timeout = aiohttp.ClientTimeout(total=40, sock_connect=15, sock_read=25)  # ← увеличено
 
     connector = aiohttp.TCPConnector(
         limit=100,
-        limit_per_host=LK_LIMIT_PER_HOST,   # используем переменную
+        limit_per_host=LK_LIMIT_PER_HOST,
         ttl_dns_cache=300,
         force_close=False,
         enable_cleanup_closed=True
@@ -1839,20 +1872,27 @@ async def main():
         headers=headers
     )
 
-    # Динамический лог с реальным значением лимита
     logger.info(f"🏛️ [LK PSUTI] Сессия создана: ПРЯМОЕ подключение (без прокси)")
-    logger.info(f"🌐 Глобальная сессия создана (limit_per_host={LK_LIMIT_PER_HOST} + User-Agent)")
+    logger.info(f"🌐 Глобальная сессия создана (limit_per_host={LK_LIMIT_PER_HOST} + User-Agent + timeout={timeout.total}s)")
 
     outgoing_ip = await get_outgoing_ip(_shared_session)
     logger.info(f"🌍 Выходной IP для lk.ks.psuti.ru: {outgoing_ip}")
 
-    actual_wk = await get_current_wk() 
-    await set_bot_commands()
-    current = await get_current_wk()
-    if current == 0:
-        logger.error("🚨 ВНИМАНИЕ: Номер недели не определен (0). Проверьте доступ к сайту ПГУТИ.")
-    else:
-        logger.info(f"🚀 Бот готов. Текущая неделя: {current}")
+    # ПРАВКА: Обработка ошибки автоопределения недели
+    try:
+        actual_wk = await get_current_wk()
+        await set_bot_commands()
+        current = await get_current_wk()
+        if current > 0:
+            logger.info(f"🚀 Бот готов. Текущая неделя: {current}")
+        else:
+            logger.error("🚨 Номер недели = 0. Проверьте доступ к ПГУТИ.")
+    except RuntimeError as e:
+        logger.critical(f"🚨 Не удалось инициализировать номер недели: {e}")
+        logger.critical("Бот работать не сможет. Проверьте доступность lk.ks.psuti.ru")
+        await _shared_session.close()
+        return
+
     # Запуск фоновых задач
     asyncio.create_task(schedule_sender())
     asyncio.create_task(periodic_save())
@@ -1863,14 +1903,12 @@ async def main():
     finally:
         logger.info("🛑 Завершение работы. Очистка ресурсов...")
         
-        # 1. Закрываем сессию
         try:
             if _shared_session:
                 await _shared_session.close()
         except Exception as e:
             logger.warning("Ошибка при закрытии сессии: %s", e)
 
-        # 2. Финальное сохранение всех данных
         try:
             save_users(user_store)
             _save_cache_file()
