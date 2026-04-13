@@ -660,6 +660,7 @@ async def fetch_page_once(session, url):
 _cache: dict[str, tuple[float, str]] = {}
 _locks_per_url: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
 _fetch_semaphore = asyncio.Semaphore(FETCH_SEMAPHORE_LIMIT)
+_load_cache_file()
 
 def _clean_old_cache():
     """Удаляет из кэша записи, которые старше MAX_CACHE_AGE_DAYS."""
@@ -675,29 +676,6 @@ def _clean_old_cache():
 
     if len(_cache) < initial_size:
         logger.info("♻️ Кэш очищен: удалено %d старых записей", initial_size - len(_cache))
-
-def _load_cache_file():
-    if not os.path.exists(CACHE_FILE):
-        return
-    try:
-        with open(CACHE_FILE, "rb") as f:
-            data = pickle.load(f)
-            if isinstance(data, dict):
-                _cache.update(data)
-                logger.info("✅ Загружен кэш из файла: %d записей", len(data))
-    except Exception as e:
-        logger.warning("❌ Не удалось загрузить кэш-файл: %s", e)
-
-def _save_cache_file():
-    try:
-        _clean_old_cache()
-
-        with open(CACHE_FILE + ".tmp", "wb") as f:
-            pickle.dump(_cache, f)
-        os.replace(CACHE_FILE + ".tmp", CACHE_FILE)
-        logger.info("💾 Кэш сохранён в файл (%d записей)", len(_cache))
-    except Exception as e:
-        logger.warning("❌ Не удалось сохранить кэш-файл: %s", e)
 
 # ----------------- АВТООПРЕДЕЛЕНИЕ НЕДЕЛИ -----------------
 async def get_current_wk() -> int:
@@ -1868,7 +1846,6 @@ async def main():
     outgoing_ip = await get_outgoing_ip(_shared_session)
     logger.info(f"🌍 Выходной IP для lk.ks.psuti.ru: {outgoing_ip}")
 
-    _load_cache_file()
     actual_wk = await get_current_wk() 
     await set_bot_commands()
     current = await get_current_wk()
