@@ -11,3 +11,5 @@ users.json
 rollback.sh
 bot_log.log
 settings.json
+update.sh
+scripts/
