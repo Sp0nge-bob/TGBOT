@@ -1,6 +1,8 @@
 import asyncio
 import re
 import aiohttp
+import zipfile
+from pathlib import Path
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, F
 from aiogram import BaseMiddleware
@@ -40,12 +42,15 @@ CALLBACK_DELAY = 1.0  # Настройка антифлуда на кнопки
 forward_queue = deque()
 user_message_cooldown = {}
 USER_DELAY = 1.0  # Антифлуд на сообщения от одного юзера
-LK_LIMIT_PER_HOST = 10 #Максимальное количество одновременных TCP-соединений
+LK_LIMIT_PER_HOST = 15 #Максимальное количество одновременных TCP-соединений
+# ----------------- AUTOBACKUP CONFIG -----------------
+AUTO_BACKUP_TIME = "03:00"      # Время автобэкапа каждый день (HH:MM)
+AUTO_BACKUP_ENABLED = True
 
 # CACHE config
-CACHE_TTL_SECONDS = 300  # TTL Кеша
+CACHE_TTL_SECONDS = 1500  # TTL Кеша
 CACHE_FILE = "page_cache.pkl"  # Бэкап
-FETCH_SEMAPHORE_LIMIT = 10
+FETCH_SEMAPHORE_LIMIT = 15
 MAX_CACHE_AGE_DAYS = 1 #Время хранения кеша в бекапе
 
 # LOCKS LRU config
@@ -134,22 +139,35 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# ----------------- STATE ----------------------
+# ----------------- PROXY CONFIG ----------------------
 from aiogram.client.session.aiohttp import AiohttpSession
 
-if PROXY_URL:
-    # Создаем сессию с прокси только для Телеграма (aiogram)
+# Загружаем режим прокси (по умолчанию — ничего не проксируем)
+PROXY_MODE = os.getenv("PROXY_MODE", "none").strip().lower()
+
+# Валидация режима
+valid_modes = {"none", "telegram", "lk", "all"}
+if PROXY_MODE not in valid_modes:
+    logger.warning(f"⚠️ Неизвестный PROXY_MODE={PROXY_MODE}. Используется none.")
+    PROXY_MODE = "none"
+
+logger.info(f"🔀 PROXY_MODE = {PROXY_MODE.upper()} | PROXY_URL = {PROXY_URL or 'не задан'}")
+
+# ----------------- TELEGRAM BOT SESSION ----------------------
+if PROXY_MODE in ("telegram", "all") and PROXY_URL:
     bot_session = AiohttpSession(proxy=PROXY_URL)
     bot = Bot(token=TOKEN, session=bot_session)
-    logger.info(f"📡 [TELEGRAM API] Работа через PROXY: {PROXY_URL.split('@')[-1] if '@' in PROXY_URL else PROXY_URL}")
+    logger.info(f"📡 [TELEGRAM API] Проксируется через {PROXY_URL.split('@')[-1] if '@' in PROXY_URL else PROXY_URL}")
 else:
     bot = Bot(token=TOKEN)
-    logger.info("📡 [TELEGRAM API] Работа напрямую (без прокси)")
+    logger.info("📡 [TELEGRAM API] Прямое подключение (без прокси)")
 
+# ----------------- STATE ----------------------
 dp = Dispatcher()
 dp.callback_query.middleware(CallbackAntiFloodMiddleware())
 START_TIME = time.time()
 TOTAL_REQUESTS = 0
+waiting_for_backup_time: set[int] = set()
 
 # ----------------- БОТ МЕНЮ -------------------
 async def set_bot_commands():
@@ -484,6 +502,10 @@ def build_admin_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📝 Текст в сообщения (Broadtask)", callback_data="admin_bt_setup")],
             [InlineKeyboardButton(text="🛠 Саппорт мод", callback_data="admin_supp")],
             [InlineKeyboardButton(text="🧹 Очистить last sent", callback_data="admin_clear_sent")],
+            [
+                InlineKeyboardButton(text="💾 Создать бэкап", callback_data="admin_backup"),
+                InlineKeyboardButton(text="⏰ Выставить автобэкап", callback_data="admin_set_backup_time")
+            ],
             [InlineKeyboardButton(text="🔍 Debug недели", callback_data="admin_debug_week")],
         ]
     )
@@ -643,27 +665,114 @@ async def schedule_sender():
 
         await asyncio.sleep(60 - datetime.datetime.now().second)
 
+async def auto_backup_task():
+    """Простой автобэкап по времени (как рассылка расписания)"""
+    global AUTO_BACKUP_TIME, AUTO_BACKUP_ENABLED
+
+    while True:
+        try:
+            if not AUTO_BACKUP_ENABLED:
+                await asyncio.sleep(30)
+                continue
+
+            current_time = datetime.datetime.now().strftime("%H:%M")
+
+            if current_time == AUTO_BACKUP_TIME:
+                logger.info(f"🕒 [AUTOBACKUP] Сработало время {AUTO_BACKUP_TIME} — запускаем бэкап")
+
+                from aiogram.types import FSInputFile
+
+                files_to_send = {
+                    "users.json": USER_FILE,
+                    "groups.json": GROUPS_FILE,
+                    "selections.json": SELECTION_FILE,
+                    "settings.json": SETTINGS_FILE,
+                    "page_cache.pkl": CACHE_FILE,
+                }
+
+                sent = 0
+                for name, path in files_to_send.items():
+                    if os.path.exists(path):
+                        try:
+                            document = FSInputFile(path)
+                            await bot.send_document(
+                                chat_id=BOT_OWNER_ID,
+                                document=document,
+                                caption=f"🔄 Автобэкап: <b>{name}</b>\n🕒 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+                                parse_mode=ParseMode.HTML
+                            )
+                            sent += 1
+                            await asyncio.sleep(0.7)
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка отправки {name}: {e}")
+
+                await bot.send_message(
+                    BOT_OWNER_ID,
+                    f"✅ <b>Автобэкап завершён!</b>\nОтправлено файлов: <b>{sent}</b>/5",
+                    parse_mode=ParseMode.HTML
+                )
+
+                logger.info(f"✅ Автобэкап завершён. Отправлено {sent} файлов")
+
+                # Ждём 70 секунд, чтобы не отправить несколько раз в одну минуту
+                await asyncio.sleep(70)
+
+            await asyncio.sleep(30)   # Проверка каждые 30 секунд
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка в auto_backup_task: {e}")
+            await asyncio.sleep(60)
+
 # ----------------- FETCH (basic) -----------------
-async def fetch_page_once(session, url):
-    start_time = time.perf_counter()
-    try:
-        # Логируем направление запроса
-        logger.info(f"🔎 [DIRECT FETCH] Запрос к ПГУТИ: {url}")
-        
-        async with session.get(url, timeout=10) as r:
-            status = r.status
-            content = await r.text()
-            duration = time.perf_counter() - start_time
-            
-            if status == 200:
-                logger.info(f"✅ [HTTP 200] Получено напрямую за {duration:.2f}s")
-            else:
-                logger.warning(f"⚠️ [HTTP {status}] Ошибка при прямом запросе")
+async def fetch_page(url: str, use_cache: bool = True) -> str:
+    global TOTAL_REQUESTS
+    TOTAL_REQUESTS += 1
+
+    cache_key = url
+    now = time.time()
+
+    # Проверка кеша
+    if use_cache and cache_key in _cache:
+        ts, html = _cache[cache_key]
+        if now - ts < CACHE_TTL_SECONDS:
+            logger.info(f"📦 [CACHE HIT] {url}")
+            return html
+
+    logger.info(f"🔎 [DIRECT FETCH] Запрос к ПГУТИ: {url}")
+
+    for attempt in range(1, 4):  # максимум 3 попытки
+        try:
+            async with _shared_session.get(url, timeout=35) as resp:  # увеличил таймаут
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise aiohttp.ClientResponseError(
+                        request_info=resp.request_info,
+                        history=resp.history,
+                        status=resp.status,
+                        message=f"HTTP {resp.status}: {text[:200]}"
+                    )
+                html = await resp.text()
                 
-            return content
-    except Exception as e:
-        logger.error(f"❌ [FETCH ERROR] Прямое соединение не удалось: {type(e).__name__}")
-        return ""
+                if len(html) < 1000:
+                    raise ValueError(f"Слишком короткий ответ: {len(html)} байт")
+
+                # Сохраняем в кеш
+                _cache[cache_key] = (now, html)
+                logger.info(f"✅ [FETCH OK] Страница загружена ({len(html)} байт, попытка {attempt})")
+                return html
+
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️ [FETCH TIMEOUT] Попытка {attempt}/3: {url}")
+        except aiohttp.ClientError as e:
+            logger.warning(f"⚠️ [FETCH ERROR] Попытка {attempt}/3: {type(e).__name__} - {e}")
+        except Exception as e:
+            logger.error(f"❌ [FETCH UNEXPECTED] Попытка {attempt}/3: {type(e).__name__} - {e}")
+
+        if attempt < 3:
+            await asyncio.sleep(1.5 * attempt)  # backoff
+
+    logger.error(f"❌ [FETCH FAILED] Не удалось загрузить {url} после 3 попыток")
+    return ""
 
 # ----------------- CACHE -----------------
 _cache: dict[str, tuple[float, str]] = {}
@@ -755,37 +864,64 @@ def _get_lock_for_url(url: str) -> asyncio.Lock:
             pass
     return lock
 
-async def get_cached_page(session, url):
+async def get_cached_page(session: aiohttp.ClientSession, url: str, use_cache: bool = True) -> str:
+    global TOTAL_REQUESTS
+    TOTAL_REQUESTS += 1
+
+    cache_key = url.strip()          # очищаем от возможных пробелов
     now = time.time()
-    cached = _cache.get(url)
-    if cached:
-        ts, val = cached
-        if now - ts < CACHE_TTL_SECONDS:
-            return val
 
-    lock = _get_lock_for_url(url)
+    # === КЭШ ПРОВЕРКА ===
+    if use_cache and cache_key in _cache:
+        ts, html = _cache[cache_key]
+        age = now - ts
 
-    async with lock:
-        cached = _cache.get(url)
-        if cached:
-            ts, val = cached
-            if now - ts < CACHE_TTL_SECONDS:
-                return val
+        if age < CACHE_TTL_SECONDS:
+            logger.info(f"📦 [CACHE HIT] {url} (возраст {age:.0f} сек)")
+            return html
+        else:
+            logger.info(f"📦 [CACHE EXPIRED] {url} — возраст {age:.0f} сек > {CACHE_TTL_SECONDS}")
 
-        async with _fetch_semaphore:
-            delay = 0.5
-            for attempt in range(3):
-                html = await fetch_page_once(session, url)
-                if html:
-                    _cache[url] = (time.time(), html)
-                    if len(_cache) % 50 == 0:
-                        _save_cache_file()
-                    return html
-                await asyncio.sleep(delay)
-                delay *= 2
+    logger.info(f"🔎 [FETCH] Запрос к ПГУТИ: {url}")
 
-        _cache[url] = (time.time(), "")
-        return ""
+    # === ЗАГРУЗКА ===
+    for attempt in range(1, 4):
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=60, sock_connect=25, sock_read=40)
+            ) as resp:
+
+                if resp.status != 200:
+                    logger.warning(f"⚠️ HTTP {resp.status} (попытка {attempt})")
+                    continue
+
+                html = await resp.text()
+
+                if len(html) < 5000:
+                    logger.warning(f"⚠️ Короткий ответ ({len(html)} байт)")
+                    continue
+
+                # === УСПЕШНО — СОХРАНЯЕМ В КЭШ ===
+                _cache[cache_key] = (now, html)
+                logger.info(f"✅ [FETCH OK] Страница загружена ({len(html)} байт) и закэширована")
+                return html
+
+        except Exception as e:
+            logger.warning(f"⚠️ [ERROR попытка {attempt}/3] {type(e).__name__}: {e}")
+
+        if attempt < 3:
+            await asyncio.sleep(2 * attempt)
+
+    logger.error(f"❌ [FETCH FAILED] Не удалось загрузить {url}")
+
+    # Мягкий fallback — если есть в кэше хоть что-то старое
+    if cache_key in _cache:
+        ts, html = _cache[cache_key]
+        logger.info(f"🔄 [OLD CACHE FALLBACK] Возвращаем устаревший кэш для {url}")
+        return html + "\n\n<i>⚠️ Использовано закэшированное расписание (может быть неактуальным).</i>"
+
+    return "⚠️ Не удалось загрузить расписание. Попробуйте обновить позже."
 
 # ----------------- SEND MESSAGE / EDIT -----------------
 async def send_or_edit_text(text: str, chat_id: int):
@@ -1471,6 +1607,65 @@ async def admin_panel_callback(cb: CallbackQuery):
                                     parse_mode=ParseMode.HTML, reply_markup=build_admin_kb())
         logger.info(f"🧹 Админ очистил last_sent_date у {count} пользователей")
 
+    elif action == "backup":
+        await cb.answer("📦 Подготавливаем бэкап файлов...")
+
+        from aiogram.types import FSInputFile
+
+        files_to_send = {
+            "users.json": USER_FILE,
+            "groups.json": GROUPS_FILE,
+            "selections.json": SELECTION_FILE,
+            "settings.json": SETTINGS_FILE,
+            "page_cache.pkl": CACHE_FILE,
+        }
+
+        sent_count = 0
+        for display_name, file_path in files_to_send.items():
+            if os.path.exists(file_path):
+                try:
+                    document = FSInputFile(file_path)
+                    
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=document,
+                        caption=f"💾 Бэкап: <b>{display_name}</b>\n📅 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+                        parse_mode=ParseMode.HTML
+                    )
+                    sent_count += 1
+                    logger.info(f"✅ Отправлен бэкап: {display_name}")
+                    await asyncio.sleep(0.6)  # небольшой антифлуд
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка отправки {display_name}: {e}")
+                    await bot.send_message(
+                        chat_id, 
+                        f"❌ Не удалось отправить <b>{display_name}</b>\nОшибка: {e}",
+                        parse_mode=ParseMode.HTML
+                    )
+            else:
+                await bot.send_message(chat_id, f"⚠️ Файл <b>{display_name}</b> не найден", parse_mode=ParseMode.HTML)
+
+        # Итоговое сообщение
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ <b>Бэкап завершён!</b>\n\nОтправлено файлов: <b>{sent_count}</b>/5",
+            parse_mode=ParseMode.HTML
+        )
+
+        logger.info(f"💾 Админ создал бэкап — успешно отправлено {sent_count} файлов")
+
+    elif action == "set_backup_time":
+        waiting_for_backup_time.add(chat_id)
+        await bot.edit_message_text(
+            f"⏰ Укажите время автобэкапа в формате <b>HH:MM</b>\n\n"
+            f"Текущее время: <b>{AUTO_BACKUP_TIME}</b>\n\n"
+            f"Пример: <code>03:30</code> или <code>04:00</code>",
+            chat_id=chat_id,
+            message_id=panel_id,
+            parse_mode=ParseMode.HTML
+        )
+
     elif action == "debug_week":
         monday_ts = get_current_monday_ts()
         current_wk = await get_current_wk()
@@ -1640,6 +1835,49 @@ async def handle_bt_input(message: Message):
                                 message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
     
     await message.answer(confirm_msg)
+
+@dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_backup_time)
+async def handle_backup_time_input(message: Message):
+    chat_id = message.chat.id
+    text = message.text.strip()
+
+    waiting_for_backup_time.discard(chat_id)
+
+    if text.lower() in ["отмена", "отменить"]:
+        await bot.edit_message_text("Добро пожаловать в админ-панель", 
+                                    chat_id=chat_id, 
+                                    message_id=admin_panel_msg_id.get(chat_id, message.message_id),
+                                    reply_markup=build_admin_kb())
+        await message.answer("Отменено.")
+        return
+
+    try:
+        # Проверка формата HH:MM
+        if ":" not in text or len(text) != 5:
+            raise ValueError
+        h, m = map(int, text.split(":"))
+        if not (0 <= h < 24 and 0 <= m < 60):
+            raise ValueError
+
+        global AUTO_BACKUP_TIME
+        AUTO_BACKUP_TIME = f"{h:02d}:{m:02d}"
+
+        await bot.edit_message_text("Добро пожаловать в админ-панель", 
+                                    chat_id=chat_id, 
+                                    message_id=admin_panel_msg_id.get(chat_id, message.message_id),
+                                    reply_markup=build_admin_kb())
+
+        await message.answer(f"✅ Время автобэкапа успешно установлено на <b>{AUTO_BACKUP_TIME}</b>\n\n"
+                           f"Каждый день в это время бот будет присылать вам бэкап файлов.", 
+                           parse_mode=ParseMode.HTML)
+
+        logger.info(f"🕒 Админ установил время автобэкапа: {AUTO_BACKUP_TIME}")
+
+    except ValueError:
+        await message.answer("⚠️ Неверный формат времени. Используйте <b>HH:MM</b> (например 03:30)", 
+                           parse_mode=ParseMode.HTML)
+        # Возвращаем в ожидание
+        waiting_for_backup_time.add(chat_id)
 # ----------------- UNIVERSAL FORWARD -----------------
 @dp.message()
 async def forward_messages(message: Message):
@@ -1849,15 +2087,18 @@ async def forward_worker():
 # ----------------- RUN -----------------
 async def main():
     logger.info("🚀 Бот запускается...")
+
+    # ----------------- GLOBAL AIOHTTP SESSION FOR LK (с поддержкой SOCKS5) ----------------------
     global _shared_session
-    timeout = aiohttp.ClientTimeout(total=40, sock_connect=15, sock_read=25)  # ← увеличено
+    timeout = aiohttp.ClientTimeout(total=60, sock_connect=25, sock_read=40)  # чуть увеличил
 
     connector = aiohttp.TCPConnector(
         limit=100,
         limit_per_host=LK_LIMIT_PER_HOST,
         ttl_dns_cache=300,
         force_close=False,
-        enable_cleanup_closed=True
+        enable_cleanup_closed=True,
+        ssl=False  # на всякий случай для проблемных прокси
     )
 
     headers = {
@@ -1865,14 +2106,35 @@ async def main():
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9"
     }
 
-    global _shared_session
-    _shared_session = aiohttp.ClientSession(
-        connector=connector,
-        timeout=timeout,
-        headers=headers
-    )
+    proxy_for_lk = None
+    if PROXY_MODE in ("lk", "all") and PROXY_URL:
+        try:
+            from aiohttp_socks import ProxyConnector
+            # Создаём специальный SOCKS-коннектор
+            proxy_connector = ProxyConnector.from_url(PROXY_URL, rdns=True)
+            _shared_session = aiohttp.ClientSession(
+                connector=proxy_connector,
+                timeout=timeout,
+                headers=headers
+            )
+            logger.info(f"🏛️ [LK PSUTI] Сессия создана ЧЕРЕЗ SOCKS5 ПРОКСИ: {PROXY_URL}")
+            proxy_for_lk = PROXY_URL
+        except ImportError:
+            logger.error("❌ Не установлена библиотека aiohttp_socks! Установи: pip install aiohttp_socks")
+            proxy_for_lk = None
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания SOCKS5 коннектора: {e}")
+            proxy_for_lk = None
 
-    logger.info(f"🏛️ [LK PSUTI] Сессия создана: ПРЯМОЕ подключение (без прокси)")
+    # Fallback на обычный коннектор, если SOCKS5 не сработал
+    if not proxy_for_lk:
+        _shared_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers
+        )
+        logger.info("🏛️ [LK PSUTI] Сессия создана: ПРЯМОЕ подключение (SOCKS5 не использовался)")
+
     logger.info(f"🌐 Глобальная сессия создана (limit_per_host={LK_LIMIT_PER_HOST} + User-Agent + timeout={timeout.total}s)")
 
     outgoing_ip = await get_outgoing_ip(_shared_session)
@@ -1897,6 +2159,7 @@ async def main():
     asyncio.create_task(schedule_sender())
     asyncio.create_task(periodic_save())
     asyncio.create_task(forward_worker())
+    asyncio.create_task(auto_backup_task())
 
     try:
         await dp.start_polling(bot)
