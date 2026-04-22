@@ -11,50 +11,73 @@ from aiogram.types import BotCommand, BotCommandScopeDefault
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
-from dotenv import load_dotenv
-from collections import deque
-from aiohttp import ClientSession
 import tempfile
 import shutil
 import datetime
-import json
 import os
 import logging
 import pickle
 import time  # used for cache timestamps
 from parser import parse_schedule_pretty, get_current_week_from_html, get_parser
-from collections import deque, OrderedDict, Counter, defaultdict
+from collections import OrderedDict, defaultdict
+from bot_modules.core import (
+    load_runtime_config,
+    load_json_file,
+    save_json_file,
+    load_users as load_users_from_file,
+    save_users as save_users_to_file,
+    async_save_users as async_save_users_to_file,
+    collect_stats as collect_stats_module,
+    render_stats_text,
+    broadcast_to_all as broadcast_to_all_module,
+)
+from bot_modules.admin_logic import (
+    process_broadcast_input,
+    process_supp_id_input,
+    process_schedule_input,
+    process_broadtask_command,
+    process_broadtask_input,
+)
+from bot_modules.admin_panel import handle_admin_panel_action
+from bot_modules.user_logic import (
+    extract_today as extract_today_logic,
+    has_classes_today as has_classes_today_logic,
+    handle_show_week as handle_show_week_logic,
+    get_today_schedule_text as get_today_schedule_text_logic,
+    get_week_schedule_text as get_week_schedule_text_logic,
+    process_cmd_today,
+    process_cmd_week,
+)
 
 # ----------------- CONFIG -----------------
-load_dotenv("/root/TGBOT/.env") # файл .env с записанным токеном, путь к файлу
-TOKEN = os.getenv("RELEASE_TOKEN") # внутри .env RELEASE_TOKEN=токен бота
-PROXY_URL = os.getenv("PROXY_URL") # Загружаем прокси из .env
-BASE_URL = "https://lk.ks.psuti.ru/?mn=2&obj=218"
-BOT_OWNER_ID = int(os.getenv("OWNERID")) #ID ТГ Аккаунта
-USER_FILE = "users.json" #Куда сохраняются пользователи
-GROUPS_FILE = "groups.json" #Где хранится список групп + курсы
-SELECTION_FILE = "selections.json" #Закешированный выбор юзеров
-SETTINGS_FILE = "settings.json"
+runtime_config = load_runtime_config()
+TOKEN = runtime_config.token # внутри .env RELEASE_TOKEN=токен бота
+PROXY_URL = runtime_config.proxy_url # Загружаем прокси из .env
+BASE_URL = runtime_config.base_url
+BOT_OWNER_ID = runtime_config.owner_id #ID ТГ Аккаунта
+USER_FILE = runtime_config.user_file #Куда сохраняются пользователи
+GROUPS_FILE = runtime_config.groups_file #Где хранится список групп + курсы
+SELECTION_FILE = runtime_config.selection_file #Закешированный выбор юзеров
+SETTINGS_FILE = runtime_config.settings_file
 GLOBAL_BROADTASK = ""
 CURRENT_WK_CACHE: dict = {"wk": 0, "ts": 0.0}
 callback_cooldown = {}
-CALLBACK_DELAY = 1.0  # Настройка антифлуда на кнопки
-forward_queue = deque()
+CALLBACK_DELAY = runtime_config.callback_delay  # Настройка антифлуда на кнопки
 user_message_cooldown = {}
-USER_DELAY = 1.0  # Антифлуд на сообщения от одного юзера
-LK_LIMIT_PER_HOST = 15 #Максимальное количество одновременных TCP-соединений
+USER_DELAY = runtime_config.user_delay  # Антифлуд на сообщения от одного юзера
+LK_LIMIT_PER_HOST = runtime_config.lk_limit_per_host #Максимальное количество одновременных TCP-соединений
 # ----------------- AUTOBACKUP CONFIG -----------------
-AUTO_BACKUP_TIME = "03:00"      # Время автобэкапа каждый день (HH:MM)
-AUTO_BACKUP_ENABLED = True
+AUTO_BACKUP_TIME = runtime_config.auto_backup_time      # Время автобэкапа каждый день (HH:MM)
+AUTO_BACKUP_ENABLED = runtime_config.auto_backup_enabled
 
 # CACHE config
-CACHE_TTL_SECONDS = 1500  # TTL Кеша
-CACHE_FILE = "page_cache.pkl"  # Бэкап
-FETCH_SEMAPHORE_LIMIT = 15
-MAX_CACHE_AGE_DAYS = 1 #Время хранения кеша в бекапе
+CACHE_TTL_SECONDS = runtime_config.cache_ttl_seconds  # TTL Кеша
+CACHE_FILE = runtime_config.cache_file  # Бэкап
+FETCH_SEMAPHORE_LIMIT = runtime_config.fetch_semaphore_limit
+MAX_CACHE_AGE_DAYS = runtime_config.max_cache_age_days #Время хранения кеша в бекапе
 
 # LOCKS LRU config
-LOCKS_CACHE_MAX = 1000  # URL локи
+LOCKS_CACHE_MAX = runtime_config.locks_cache_max  # URL локи
 
 async def get_outgoing_ip(session: aiohttp.ClientSession) -> str:
     """Определяет реальный выходной IP (работает и с прокси, и без)"""
@@ -143,7 +166,7 @@ logger.addHandler(console_handler)
 from aiogram.client.session.aiohttp import AiohttpSession
 
 # Загружаем режим прокси (по умолчанию — ничего не проксируем)
-PROXY_MODE = os.getenv("PROXY_MODE", "none").strip().lower()
+PROXY_MODE = runtime_config.proxy_mode
 
 # Валидация режима
 valid_modes = {"none", "telegram", "lk", "all"}
@@ -223,16 +246,6 @@ last_sent_today: dict[int, str] = {}
 _shared_session: aiohttp.ClientSession | None = None
 
 # ----------------- STORAGE -----------------
-def load_json_file(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_json_file(path: str, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 def load_settings():
     global GLOBAL_BROADTASK
@@ -242,31 +255,21 @@ def load_settings():
 def save_settings():
     save_json_file(SETTINGS_FILE, {"broadtask": GLOBAL_BROADTASK})
 
+def set_global_broadtask(value: str):
+    global GLOBAL_BROADTASK
+    GLOBAL_BROADTASK = value
+
 load_settings()
 
 def load_users():
     """Загружает всех пользователей из файла целиком"""
-    try:
-        raw = load_json_file(USER_FILE)
-        # Убеждаемся, что все ключи — строки для консистентности JSON
-        return {str(k): v for k, v in raw.items()}
-    except Exception as e:
-        logger.error(f"Ошибка загрузки пользователей: {e}")
-        return {}
+    return load_users_from_file(USER_FILE, logger)
 
 def save_users(users):
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tmp:
-            json.dump(users, tmp, ensure_ascii=False, indent=2)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        
-        # Атомарная замена
-        shutil.move(tmp.name, USER_FILE)
-    except Exception as e:
-        logger.error(f"Ошибка атомарного сохранения users: {e}")
-        if os.path.exists(tmp.name):
-            os.unlink(tmp.name)
+    save_users_to_file(users, USER_FILE, logger)
+
+async def async_save_users(users):
+    await async_save_users_to_file(users, USER_FILE, logger)
 
 # Инициализация хранилища
 user_store = load_users()
@@ -291,7 +294,7 @@ def register_user_from_message(msg):
     try:
         user = msg.from_user
         update_user_activity(user.id, user.username)
-    except:
+    except AttributeError:
         pass
 
 groups: dict[str, dict] = load_json_file(GROUPS_FILE)
@@ -300,10 +303,24 @@ async def periodic_save():
     while True:
         await asyncio.sleep(1200) # 20 минут
         try:
-            save_users(user_store)
+            await async_save_users(user_store)
             logger.info("💾 Автосохранение пользователей выполнено")
         except Exception as e:
             logger.error(f"❌ Ошибка при плановом сохранении: {e}")
+
+async def periodic_cleanup():
+    """Периодическая очистка in-memory структур от устаревших записей."""
+    while True:
+        try:
+            now = time.time()
+            callback_cooldown.clear()
+            stale_users = [uid for uid, ts in user_message_cooldown.items() if now - ts > 3600]
+            for uid in stale_users:
+                user_message_cooldown.pop(uid, None)
+            _clean_old_cache()
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка periodic_cleanup: {e}")
+        await asyncio.sleep(1800)
 # ----------------- SELECTION STORAGE -----------------
 def _load_cache_file():
     global _cache, CURRENT_WK_CACHE
@@ -392,45 +409,16 @@ def get_current_monday_ts() -> float:
     return monday_midnight.timestamp()
 
 def get_stats_text() -> str:
-    uptime_seconds = int(time.time() - START_TIME)
-    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
-    cache_size = len(_cache)
-    total_users = len(user_store)
-    if selected_group_per_chat:
-        most_popular_group, group_count = Counter(selected_group_per_chat.values()).most_common(1)[0]
-    else:
-        most_popular_group, group_count = "Нет данных", 0
-    total_reqs = TOTAL_REQUESTS
-    last_user_name = "Нет данных"
-    last_time = 0
-    for uid_str, info in user_store.items():
-        if int(uid_str) == BOT_OWNER_ID:
-            continue
-        user_time = info.get("last_activity", 0)
-        if user_time > last_time:
-            last_time = user_time
-            last_user_name = info.get("username", "без_ника")
-    last_use_text = f"@{last_user_name} ({datetime.datetime.fromtimestamp(last_time).strftime('%d.%m.%Y %H:%M:%S')})" if last_time > 0 else "Никто еще не пользовался"
-    active_schedules = sum(1 for info in user_store.values() if "schedule_time" in info)
-    today_iso = datetime.date.today().isoformat()
-    today_sent = sum(1 for info in user_store.values() if info.get("last_sent_date") == today_iso)
-    last_sent_info = None
-    for uid_str, info in user_store.items():
-        if info.get("last_sent_date") == today_iso and "last_sent_time" in info:
-            if last_sent_info is None or info["last_sent_time"] > last_sent_info[1]:
-                last_sent_info = (info.get("username", "без ника"), info["last_sent_time"], uid_str)
-    last_sent_text = f"@{last_sent_info[0]} в {last_sent_info[1]}" if last_sent_info else "Сегодня ещё не было"
-    return (
-        f"📊 <b>Статистика бота</b>\n\n"
-        f"⏱ <b>Время работы:</b> {uptime_str}\n"
-        f"📦 <b>Размер кеша:</b> {cache_size} стр.\n"
-        f"👥 <b>Всего юзеров:</b> {total_users}\n"
-        f"🏆 <b>Популярная группа:</b> {most_popular_group} ({group_count} чел.)\n"
-        f"📈 <b>Всего запросов:</b> {total_reqs}\n"
-        f"👤 <b>Последний активный:</b> {last_use_text}\n"
-        f"🔔 <b>Подключено рассылок:</b> {active_schedules}\n"
-        f"📨 <b>Рассылок отправлено сегодня:</b> {today_sent}\n"
-        f"⏰ <b>Последняя рассылка:</b> {last_sent_text}\n"
+    return render_stats_text(collect_stats())
+
+def collect_stats() -> dict[str, str | int]:
+    return collect_stats_module(
+        start_time=START_TIME,
+        cache_size=len(_cache),
+        user_store=user_store,
+        selected_group_per_chat=selected_group_per_chat,
+        total_requests=TOTAL_REQUESTS,
+        bot_owner_id=BOT_OWNER_ID,
     )
 
 
@@ -540,22 +528,10 @@ def build_groups_kb(groups_list):
 
 # ----------------- SCHEDULE SENDER (РАССЫЛКА) -----------------
 def extract_today(schedule_text: str) -> str:
-    days = [
-        "понедельник", "вторник", "среда", "четверг",
-        "пятница", "суббота", "воскресенье"
-    ]
-    today = days[datetime.datetime.now().weekday()]
-
-    blocks = schedule_text.split("📅")
-    for block in blocks:
-        if today in block.lower():
-            return "📅 " + block.strip()
-    return "📅 Сегодня занятий нет (или день не найден в расписании)"
+    return extract_today_logic(schedule_text)
 
 def has_classes_today(week_text: str) -> bool:
-    today_text = extract_today(week_text)
-    # Отправляем ВСЕГДА, если блок дня есть
-    return len(today_text.strip()) > 10 and "не найден" not in today_text.lower()
+    return has_classes_today_logic(week_text)
 
 async def schedule_sender():
     while True:
@@ -657,7 +633,7 @@ async def schedule_sender():
                         logger.error(f"❌ Рассылка {uid_int}: {e}")
 
             if sent_count > 0:
-                save_users(user_store)
+                await async_save_users(user_store)
                 logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count}")
 
         except Exception as e:
@@ -723,57 +699,6 @@ async def auto_backup_task():
             logger.error(f"❌ Ошибка в auto_backup_task: {e}")
             await asyncio.sleep(60)
 
-# ----------------- FETCH (basic) -----------------
-async def fetch_page(url: str, use_cache: bool = True) -> str:
-    global TOTAL_REQUESTS
-    TOTAL_REQUESTS += 1
-
-    cache_key = url
-    now = time.time()
-
-    # Проверка кеша
-    if use_cache and cache_key in _cache:
-        ts, html = _cache[cache_key]
-        if now - ts < CACHE_TTL_SECONDS:
-            logger.info(f"📦 [CACHE HIT] {url}")
-            return html
-
-    logger.info(f"🔎 [DIRECT FETCH] Запрос к ПГУТИ: {url}")
-
-    for attempt in range(1, 4):  # максимум 3 попытки
-        try:
-            async with _shared_session.get(url, timeout=35) as resp:  # увеличил таймаут
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise aiohttp.ClientResponseError(
-                        request_info=resp.request_info,
-                        history=resp.history,
-                        status=resp.status,
-                        message=f"HTTP {resp.status}: {text[:200]}"
-                    )
-                html = await resp.text()
-                
-                if len(html) < 1000:
-                    raise ValueError(f"Слишком короткий ответ: {len(html)} байт")
-
-                # Сохраняем в кеш
-                _cache[cache_key] = (now, html)
-                logger.info(f"✅ [FETCH OK] Страница загружена ({len(html)} байт, попытка {attempt})")
-                return html
-
-        except asyncio.TimeoutError:
-            logger.warning(f"⚠️ [FETCH TIMEOUT] Попытка {attempt}/3: {url}")
-        except aiohttp.ClientError as e:
-            logger.warning(f"⚠️ [FETCH ERROR] Попытка {attempt}/3: {type(e).__name__} - {e}")
-        except Exception as e:
-            logger.error(f"❌ [FETCH UNEXPECTED] Попытка {attempt}/3: {type(e).__name__} - {e}")
-
-        if attempt < 3:
-            await asyncio.sleep(1.5 * attempt)  # backoff
-
-    logger.error(f"❌ [FETCH FAILED] Не удалось загрузить {url} после 3 попыток")
-    return ""
-
 # ----------------- CACHE -----------------
 _cache: dict[str, tuple[float, str]] = {}
 _locks_per_url: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
@@ -823,7 +748,7 @@ async def get_current_wk() -> int:
 
             if wk > 0:
                 CURRENT_WK_CACHE = {"wk": wk, "ts": now}
-                _save_cache_file()
+                await asyncio.to_thread(_save_cache_file)
                 logger.info(f"✅ Определена неделя: {wk} (через {parser_name})")
                 return wk
             
@@ -877,12 +802,12 @@ async def get_cached_page(session: aiohttp.ClientSession, url: str, use_cache: b
         age = now - ts
 
         if age < CACHE_TTL_SECONDS:
-            logger.info(f"📦 [CACHE HIT] {url} (возраст {age:.0f} сек)")
+            logger.debug(f"📦 [CACHE HIT] {url} (возраст {age:.0f} сек)")
             return html
         else:
-            logger.info(f"📦 [CACHE EXPIRED] {url} — возраст {age:.0f} сек > {CACHE_TTL_SECONDS}")
+            logger.debug(f"📦 [CACHE EXPIRED] {url} — возраст {age:.0f} сек > {CACHE_TTL_SECONDS}")
 
-    logger.info(f"🔎 [FETCH] Запрос к ПГУТИ: {url}")
+    logger.debug(f"🔎 [FETCH] Запрос к ПГУТИ: {url}")
 
     # === ЗАГРУЗКА ===
     for attempt in range(1, 4):
@@ -904,7 +829,7 @@ async def get_cached_page(session: aiohttp.ClientSession, url: str, use_cache: b
 
                 # === УСПЕШНО — СОХРАНЯЕМ В КЭШ ===
                 _cache[cache_key] = (now, html)
-                logger.info(f"✅ [FETCH OK] Страница загружена ({len(html)} байт) и закэширована")
+                logger.debug(f"✅ [FETCH OK] Страница загружена ({len(html)} байт) и закэширована")
                 return html
 
         except Exception as e:
@@ -997,15 +922,17 @@ async def send_or_edit_text(text: str, chat_id: int):
     last_text_per_chat[chat_id] = text
 
 # ----------------- SHOW WEEK -----------------
-async def handle_show_week(message, wk, reply_message):
-    chat_id = message.chat.id
-    html = await get_cached_page(_shared_session, build_url_for_wk(wk, chat_id))
-
-    text = parse_schedule_pretty(html)
-    group = selected_group_per_chat.get(chat_id, "не выбрана")
-    text = f"👤 <b>Ваша группа:</b> {group}\n\n{text}"
-
-    await send_or_edit_text(text, chat_id)
+async def handle_show_week(message, wk):
+    await handle_show_week_logic(
+        message=message,
+        wk=wk,
+        get_cached_page=get_cached_page,
+        shared_session=_shared_session,
+        build_url_for_wk=build_url_for_wk,
+        parse_schedule_pretty=parse_schedule_pretty,
+        selected_group_per_chat=selected_group_per_chat,
+        send_or_edit_text=send_or_edit_text,
+    )
 
 # ----------------- БОТ КОМАНДЫ -----------------
 @dp.message(Command("start"))
@@ -1028,63 +955,40 @@ async def start(message: Message):
 
 @dp.message(Command("schedule", "today"))
 async def cmd_schedule_today(message: Message):
-    chat_id = message.chat.id
-    group = selected_group_per_chat.get(chat_id)
-    
-    if not group:
-        await message.answer("⚠️ Сначала выбери группу командой /start")
-        return
-
-    wk = await get_current_wk()
-    current_wk_per_chat[chat_id] = wk
-
-    url = build_url_for_wk(wk, chat_id)
-    html = await get_cached_page(_shared_session, url)
-    
-    week_text = parse_schedule_pretty(html)
-    today_text = extract_today(week_text)
-
-    text = f"👤 <b>Ваша группа:</b> {group}\n\n{today_text}"
-
-    # Отправляем + сохраняем для кнопок «обновить / неделя»
-    msg = await message.answer(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=make_inline_kb()
+    result = await process_cmd_today(
+        message=message,
+        selected_group_per_chat=selected_group_per_chat,
+        get_current_wk=get_current_wk,
+        current_wk_per_chat=current_wk_per_chat,
+        build_url_for_wk=build_url_for_wk,
+        get_cached_page=get_cached_page,
+        shared_session=_shared_session,
+        parse_schedule_pretty=parse_schedule_pretty,
+        reply_markup=make_inline_kb,
     )
-    
-    last_msg_per_chat[chat_id] = msg.message_id
-    last_text_per_chat[chat_id] = text
+    if result:
+        msg, text = result
+        last_msg_per_chat[message.chat.id] = msg.message_id
+        last_text_per_chat[message.chat.id] = text
 
 
 @dp.message(Command("week"))
 async def cmd_week(message: Message):
-    chat_id = message.chat.id
-    group = selected_group_per_chat.get(chat_id)
-    
-    if not group:
-        await message.answer("⚠️ Сначала выбери группу командой /start")
-        return
-
-    wk = await get_current_wk()
-    current_wk_per_chat[chat_id] = wk
-
-    url = build_url_for_wk(wk, chat_id)
-    html = await get_cached_page(_shared_session, url)
-    
-    week_text = parse_schedule_pretty(html)
-
-    text = f"👤 <b>Ваша группа:</b> {group}\n\n{week_text}"
-
-    # Отправляем + сохраняем для кнопок
-    msg = await message.answer(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=make_inline_kb()
+    result = await process_cmd_week(
+        message=message,
+        selected_group_per_chat=selected_group_per_chat,
+        get_current_wk=get_current_wk,
+        current_wk_per_chat=current_wk_per_chat,
+        build_url_for_wk=build_url_for_wk,
+        get_cached_page=get_cached_page,
+        shared_session=_shared_session,
+        parse_schedule_pretty=parse_schedule_pretty,
+        reply_markup=make_inline_kb,
     )
-    
-    last_msg_per_chat[chat_id] = msg.message_id
-    last_text_per_chat[chat_id] = text
+    if result:
+        msg, text = result
+        last_msg_per_chat[message.chat.id] = msg.message_id
+        last_text_per_chat[message.chat.id] = text
 
 # ----------------- GROUP MENU -----------------
 @dp.callback_query(F.data == "change_group")
@@ -1150,42 +1054,30 @@ async def select_group(cb: CallbackQuery):
     wk = await get_current_wk()
     current_wk_per_chat[chat_id] = wk
 
-    await handle_show_week(cb.message, wk, cb.message)
+    await handle_show_week(cb.message, wk)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КОМАНД ====================
 
 async def get_today_schedule_text(chat_id: int) -> str:
-    """Возвращает красивое расписание ТОЛЬКО на сегодня"""
-    group = selected_group_per_chat.get(chat_id)
-    if not group:
-        return "⚠️ Сначала выбери группу командой /start"
-
-    url = build_url_for_wk(None, chat_id)                    # текущая неделя
-    html = await get_cached_page(_shared_session, url)       # ← ИСПРАВЛЕНО!
-    
-    if not html:
-        return "❌ Не удалось загрузить расписание"
-
-    week_text = parse_schedule_pretty(html)
-    today_text = extract_today(week_text)
-
-    return f"👤 <b>Ваша группа:</b> {group}\n\n{today_text}"
+    return await get_today_schedule_text_logic(
+        chat_id=chat_id,
+        selected_group_per_chat=selected_group_per_chat,
+        build_url_for_wk=build_url_for_wk,
+        get_cached_page=get_cached_page,
+        shared_session=_shared_session,
+        parse_schedule_pretty=parse_schedule_pretty,
+    )
 
 
 async def get_week_schedule_text(chat_id: int) -> str:
-    """Возвращает полное расписание на неделю"""
-    group = selected_group_per_chat.get(chat_id)
-    if not group:
-        return "⚠️ Сначала выбери группу командой /start"
-
-    url = build_url_for_wk(None, chat_id)
-    html = await get_cached_page(_shared_session, url)       # ← ИСПРАВЛЕНО!
-    
-    if not html:
-        return "❌ Не удалось загрузить расписание"
-
-    week_text = parse_schedule_pretty(html)
-    return f"👤 <b>Ваша группа:</b> {group}\n\n{week_text}"
+    return await get_week_schedule_text_logic(
+        chat_id=chat_id,
+        selected_group_per_chat=selected_group_per_chat,
+        build_url_for_wk=build_url_for_wk,
+        get_cached_page=get_cached_page,
+        shared_session=_shared_session,
+        parse_schedule_pretty=parse_schedule_pretty,
+    )
 
 # ----------------- WEEK BUTTONS -----------------
 @dp.callback_query(F.data.startswith("wk_"))
@@ -1218,7 +1110,7 @@ async def week_buttons(cb: CallbackQuery):
     # сохраняем выбранную неделю
     current_wk_per_chat[cb.message.chat.id] = wk
 
-    await handle_show_week(cb.message, wk, cb.message)
+    await handle_show_week(cb.message, wk)
 
 @dp.callback_query(F.data == "day_today")
 async def show_today(cb: CallbackQuery):
@@ -1316,59 +1208,7 @@ async def schedule_disable(cb: CallbackQuery):
 async def show_stats(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
-
-    # 1. Время работы бота
-    uptime_seconds = int(time.time() - START_TIME)
-    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
-
-    # 2. Размер кеша
-    cache_size = len(_cache)
-
-    # 3. Всего юзеров
-    total_users = len(user_store)
-
-    # 4. Популярная группа
-    if selected_group_per_chat:
-        most_popular_group, group_count = Counter(selected_group_per_chat.values()).most_common(1)[0]
-    else:
-        most_popular_group, group_count = "Нет данных", 0
-
-    # 5. Всего запросов
-    total_reqs = TOTAL_REQUESTS
-
-    # 6. Последний активный (исключая владельца)
-    last_user_name = "Нет данных"
-    last_time = 0
-    for uid_str, info in user_store.items():
-        if int(uid_str) == BOT_OWNER_ID:
-            continue
-        user_time = info.get("last_activity", 0)
-        if user_time > last_time:
-            last_time = user_time
-            last_user_name = info.get("username", "без_ника")
-    last_use_text = f"@{last_user_name} ({datetime.datetime.fromtimestamp(last_time).strftime('%d.%m.%Y %H:%M:%S')})" if last_time > 0 else "Никто еще не пользовался"
-
-    # 7. Активные рассылки
-    active_schedules = sum(1 for info in user_store.values() if "schedule_time" in info)
-
-    # === НОВОЕ ===
-    today_iso = datetime.date.today().isoformat()
-    today_sent = sum(1 for info in user_store.values() if info.get("last_sent_date") == today_iso)
-
-    # Последняя рассылка сегодня
-    last_sent_info = None
-    for uid_str, info in user_store.items():
-        if info.get("last_sent_date") == today_iso and "last_sent_time" in info:
-            if last_sent_info is None or info["last_sent_time"] > last_sent_info[1]:
-                last_sent_info = (info.get("username", "без ника"), info["last_sent_time"], uid_str)
-
-    if last_sent_info:
-        last_sent_text = f"@{last_sent_info[0]} в {last_sent_info[1]}"
-    else:
-        last_sent_text = "Сегодня ещё не было"
-
     text = get_stats_text()
-
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(Command("list_users"))
@@ -1381,15 +1221,6 @@ async def list_users(message: Message):
 async def schedule_list(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
-
-    lines = []
-    for uid_str, info in sorted(user_store.items(), key=lambda x: x[1].get("schedule_time", "99:99")):
-        if "schedule_time" in info:
-            username = info.get("username", "без ника")
-            group = selected_group_per_chat.get(int(uid_str), "не выбрана")
-            time = info["schedule_time"]
-            lines.append(f"• {uid_str} — @{username} → <b>{time}</b> (группа: {group})")
-
     text = get_schedule_list_text()
     if "<b>" in text:  # активные рассылки
         await message.answer(text, parse_mode=ParseMode.HTML)
@@ -1398,6 +1229,15 @@ async def schedule_list(message: Message):
 
 # словарь: user_id -> target_id (кому пересылать)
 active_supp: dict[int, int] = {}
+
+async def broadcast_to_all(source_chat_id: int, source_message_id: int) -> tuple[int, int]:
+    return await broadcast_to_all_module(
+        bot=bot,
+        user_store=user_store,
+        source_chat_id=source_chat_id,
+        source_message_id=source_message_id,
+        delay_seconds=0.05,
+    )
 
 @dp.message(Command("broadcast"))
 async def broadcast(message: Message):
@@ -1409,25 +1249,7 @@ async def broadcast(message: Message):
         return
 
     msg = message.reply_to_message
-
-    sent = 0
-    failed = 0
-
-    for uid in user_store:
-        user_id = int(uid)
-
-        try:
-            await bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id
-            )
-
-            sent += 1
-            await asyncio.sleep(0.05)
-
-        except Exception:
-            failed += 1
+    sent, failed = await broadcast_to_all(msg.chat.id, msg.message_id)
 
     await message.answer(
         f"📢 Рассылка завершена\n\n"
@@ -1556,285 +1378,91 @@ async def admin_panel_callback(cb: CallbackQuery):
         await cb.message.answer("Панель не найдена. Вызови /admin")
         return
 
-    if action == "stats":
-        text = get_stats_text()
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
-                                    parse_mode=ParseMode.HTML, reply_markup=build_admin_kb())
-
-    elif action == "users":
-        text = get_users_list_text()
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
-                                    reply_markup=build_admin_kb())
-
-    elif action == "schedules":
-        text = get_schedule_list_text()
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
-                                    parse_mode=ParseMode.HTML if "<b>" in text else None,
-                                    reply_markup=build_admin_kb())
-
-    elif action == "broadcast":
-        waiting_for_broadcast.add(chat_id)
-        await bot.edit_message_text(
-            "Напишите сообщение для массового оповещения, либо напишите отмена.",
-            chat_id=chat_id, message_id=panel_id
-        )
-
-    elif action == "bt_setup":
-        waiting_for_broadtask.add(chat_id)
-        current_status = f"\n\n<b>Текущий текст:</b>\n<i>{GLOBAL_BROADTASK}</i>" if GLOBAL_BROADTASK else "\n\n(Сейчас пусто)"
-        await bot.edit_message_text(
-            f"Введите текст, который будет автоматически добавляться в конец КАЖДОГО сообщения бота.{current_status}\n\n"
-            f"Отправьте <b>clear</b>, чтобы удалить текст, или <b>отмена</b>.",
-            chat_id=chat_id, message_id=panel_id, parse_mode=ParseMode.HTML
-        )
-
-    elif action == "supp":
-        lines = [f"{uid} — @{info.get('username', 'без ника')}" for uid, info in
-                 sorted(user_store.items(), key=lambda x: int(x[0]))]
-        text = "📋 Список пользователей:\n\n" + "\n".join(lines) + "\n\nУкажите ID для связи (или отмена)"
-        waiting_for_supp_id.add(chat_id)
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id)
-
-    elif action == "clear_sent":
-        count = 0
-        for uid_str, info in user_store.items():
-            if "last_sent_date" in info:
-                del info["last_sent_date"]
-                count += 1
-        save_users(user_store)
-        text = f"✅ <b>last_sent_date очищен у {count} пользователей!</b>\n\nТеперь рассылка сработает сегодня."
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
-                                    parse_mode=ParseMode.HTML, reply_markup=build_admin_kb())
-        logger.info(f"🧹 Админ очистил last_sent_date у {count} пользователей")
-
-    elif action == "backup":
-        await cb.answer("📦 Подготавливаем бэкап файлов...")
-
-        from aiogram.types import FSInputFile
-
-        files_to_send = {
-            "users.json": USER_FILE,
-            "groups.json": GROUPS_FILE,
-            "selections.json": SELECTION_FILE,
-            "settings.json": SETTINGS_FILE,
-            "page_cache.pkl": CACHE_FILE,
-        }
-
-        sent_count = 0
-        for display_name, file_path in files_to_send.items():
-            if os.path.exists(file_path):
-                try:
-                    document = FSInputFile(file_path)
-                    
-                    await bot.send_document(
-                        chat_id=chat_id,
-                        document=document,
-                        caption=f"💾 Бэкап: <b>{display_name}</b>\n📅 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
-                        parse_mode=ParseMode.HTML
-                    )
-                    sent_count += 1
-                    logger.info(f"✅ Отправлен бэкап: {display_name}")
-                    await asyncio.sleep(0.6)  # небольшой антифлуд
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка отправки {display_name}: {e}")
-                    await bot.send_message(
-                        chat_id, 
-                        f"❌ Не удалось отправить <b>{display_name}</b>\nОшибка: {e}",
-                        parse_mode=ParseMode.HTML
-                    )
-            else:
-                await bot.send_message(chat_id, f"⚠️ Файл <b>{display_name}</b> не найден", parse_mode=ParseMode.HTML)
-
-        # Итоговое сообщение
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"✅ <b>Бэкап завершён!</b>\n\nОтправлено файлов: <b>{sent_count}</b>/5",
-            parse_mode=ParseMode.HTML
-        )
-
-        logger.info(f"💾 Админ создал бэкап — успешно отправлено {sent_count} файлов")
-
-    elif action == "set_backup_time":
-        waiting_for_backup_time.add(chat_id)
-        await bot.edit_message_text(
-            f"⏰ Укажите время автобэкапа в формате <b>HH:MM</b>\n\n"
-            f"Текущее время: <b>{AUTO_BACKUP_TIME}</b>\n\n"
-            f"Пример: <code>03:30</code> или <code>04:00</code>",
-            chat_id=chat_id,
-            message_id=panel_id,
-            parse_mode=ParseMode.HTML
-        )
-
-    elif action == "debug_week":
-        monday_ts = get_current_monday_ts()
-        current_wk = await get_current_wk()
-        text = (
-            f"🔍 <b>Отладка автоопределения недели</b>\n\n"
-            f"📅 Сегодня: <b>{datetime.datetime.now().strftime('%A %d.%m.%Y %H:%M')}</b>\n\n"
-            f"Понедельник этой недели (00:00): <b>{datetime.datetime.fromtimestamp(monday_ts).strftime('%d.%m.%Y %H:%M')}</b>\n"
-            f"monday_ts = <code>{monday_ts}</code>\n\n"
-            f"CURRENT_WK_CACHE:\n   wk = <b>{CURRENT_WK_CACHE['wk']}</b>\n   ts = <code>{CURRENT_WK_CACHE['ts']}</code>\n\n"
-            f"✅ Определённая неделя: <b>{current_wk}</b>"
-        )
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
-                                    parse_mode=ParseMode.HTML, reply_markup=build_admin_kb())
-        CURRENT_WK_CACHE["ts"] = 0
-        logger.info("🔄 Кеш недели сброшен через админ-панель")
+    await handle_admin_panel_action(
+        action=action,
+        cb=cb,
+        bot=bot,
+        chat_id=chat_id,
+        panel_id=panel_id,
+        build_admin_kb=build_admin_kb,
+        get_stats_text=get_stats_text,
+        get_users_list_text=get_users_list_text,
+        get_schedule_list_text=get_schedule_list_text,
+        waiting_for_broadcast=waiting_for_broadcast,
+        waiting_for_broadtask=waiting_for_broadtask,
+        waiting_for_supp_id=waiting_for_supp_id,
+        waiting_for_backup_time=waiting_for_backup_time,
+        user_store=user_store,
+        selected_group_per_chat=selected_group_per_chat,
+        save_users=save_users,
+        logger=logger,
+        get_broadtask=lambda: GLOBAL_BROADTASK,
+        user_file=USER_FILE,
+        groups_file=GROUPS_FILE,
+        selection_file=SELECTION_FILE,
+        settings_file=SETTINGS_FILE,
+        cache_file=CACHE_FILE,
+        auto_backup_time=AUTO_BACKUP_TIME,
+        get_current_monday_ts=get_current_monday_ts,
+        get_current_wk=get_current_wk,
+        current_wk_cache=CURRENT_WK_CACHE,
+    )
 
 
 @dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_broadcast)
 async def handle_broadcast_input(message: Message):
-    chat_id = message.chat.id
-    if message.text and message.text.strip().lower() in ["отмена", "отменить"]:
-        waiting_for_broadcast.discard(chat_id)
-        await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
-                                    message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
-        await message.answer("Отменено.")
-        return
-
-    sent = failed = 0
-    for uid in user_store:
-        try:
-            await bot.copy_message(chat_id=int(uid), from_chat_id=message.chat.id, message_id=message.message_id)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except:
-            failed += 1
-    waiting_for_broadcast.discard(chat_id)
-    await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
-                                message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
-    await message.answer(f"📢 Рассылка завершена\nОтправлено: {sent}\nОшибок: {failed}")
+    await process_broadcast_input(
+        message=message,
+        bot=bot,
+        waiting_for_broadcast=waiting_for_broadcast,
+        admin_panel_msg_id=admin_panel_msg_id,
+        build_admin_kb=build_admin_kb,
+        broadcast_to_all=broadcast_to_all,
+    )
 
 
 @dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_supp_id)
 async def handle_supp_id_input(message: Message):
-    chat_id = message.chat.id
-    text = message.text.strip().lower()
-    if text in ["отмена", "отменить"]:
-        waiting_for_supp_id.discard(chat_id)
-        await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
-                                    message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
-        await message.answer("Отменено.")
-        return
-    try:
-        target_id = int(text)
-    except:
-        await message.answer("Неверный ID, попробуйте снова или отмена.")
-        return
-    target_str = str(target_id)
-    if target_str not in user_store:
-        await message.answer("Такого пользователя нет.")
-        return
-    active_supp[message.from_user.id] = target_id
-    waiting_for_supp_id.discard(chat_id)
-    await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
-                                message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
-    await message.answer(f"🎯 Переписка с → {target_id} активирована (/supp_stop для остановки)")
+    await process_supp_id_input(
+        message=message,
+        bot=bot,
+        waiting_for_supp_id=waiting_for_supp_id,
+        admin_panel_msg_id=admin_panel_msg_id,
+        build_admin_kb=build_admin_kb,
+        user_store=user_store,
+        active_supp=active_supp,
+    )
 
 @dp.message(lambda message: message.chat.id in waiting_for_schedule_time)
 async def schedule_input(message: Message):
-    chat_id = message.chat.id
-    uid = str(message.from_user.id)
-    text = message.text.strip().lower()
-
-    if text == "отменить рассылку" or text == "отмена":
-        if uid in user_store:
-            user_store[uid].pop("schedule_time", None)
-            save_users(user_store)
-        
-        waiting_for_schedule_time.discard(chat_id)
-        await message.answer("✅ Рассылка отключена.")
-        return
-
-    try:
-        # Проверка формата
-        if ":" not in text:
-            raise ValueError
-        
-        h_str, m_str = text.split(":")
-        h, m = int(h_str), int(m_str)
-
-        if not (0 <= h < 24 and 0 <= m < 60):
-            raise ValueError
-
-        formatted_time = f"{h:02d}:{m:02d}"
-
-        # Сохранение в базу
-        if uid not in user_store:
-            user_store[uid] = {}
-        
-        user_store[uid]["username"] = message.from_user.username or user_store[uid].get("username", "unknown")
-        user_store[uid]["schedule_time"] = formatted_time
-        user_store[uid]["last_activity"] = time.time()
-        
-        # ВАЖНО: сохраняем в файл сразу
-        save_users(user_store)
-
-        waiting_for_schedule_time.discard(chat_id)
-        await message.answer(f"✅ Успешно! Теперь каждый день в <b>{formatted_time}</b> я буду присылать вам расписание (если есть пары).", parse_mode=ParseMode.HTML)
-        
-    except ValueError:
-        await message.answer("⚠️ Неверный формат. Пожалуйста, введите время как <b>08:30</b> или напишите 'Отмена'.", parse_mode=ParseMode.HTML)
+    await process_schedule_input(
+        message=message,
+        waiting_for_schedule_time=waiting_for_schedule_time,
+        user_store=user_store,
+        save_users=save_users,
+    )
 
 @dp.message(Command("broadtask"))
 async def set_broadtask(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
-
-    global GLOBAL_BROADTASK
-    # Убираем команду из текста
-    args = message.text.split(maxsplit=1)
-    
-    if len(args) < 2:
-        await message.answer("⚠️ Использование:\n`/broadtask Текст` — установить\n`/broadtask clear` — удалить", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    payload = args[1].strip()
-
-    if payload.lower() == "clear":
-        GLOBAL_BROADTASK = ""
-        save_settings()
-        await message.answer("✅ Оповещение полностью удалено.")
-    else:
-        GLOBAL_BROADTASK = payload
-        save_settings()
-        await message.answer(f"✅ Новое оповещение установлено:\n\n{GLOBAL_BROADTASK}")
+    await process_broadtask_command(
+        message=message,
+        save_settings=save_settings,
+        set_broadtask=set_global_broadtask,
+    )
 
 @dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_broadtask)
 async def handle_bt_input(message: Message):
-    chat_id = message.chat.id
-    global GLOBAL_BROADTASK
-    
-    # Сбрасываем состояние ожидания сразу
-    waiting_for_broadtask.discard(chat_id)
-    
-    # Если нажали отмену
-    if message.text and message.text.strip().lower() in ["отмена", "отменить"]:
-        await message.answer("Изменение текста отменено.")
-        # Возвращаем панель в исходное состояние
-        await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
-                                    message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
-        return
-
-    # Логика сохранения или очистки
-    input_text = message.text.strip() if message.text else ""
-    
-    if input_text.lower() == "clear":
-        GLOBAL_BROADTASK = ""
-        confirm_msg = "✅ Дополнительный текст удален."
-    else:
-        GLOBAL_BROADTASK = input_text
-        confirm_msg = f"✅ Текст успешно установлен:\n\n{GLOBAL_BROADTASK}"
-
-    # Сохраняем в файл, чтобы не пропало после перезагрузки
-    save_settings()
-    
-    # Возвращаем админ-панель
-    await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
-                                message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
-    
-    await message.answer(confirm_msg)
+    await process_broadtask_input(
+        message=message,
+        bot=bot,
+        waiting_for_broadtask=waiting_for_broadtask,
+        admin_panel_msg_id=admin_panel_msg_id,
+        build_admin_kb=build_admin_kb,
+        save_settings=save_settings,
+        set_broadtask=set_global_broadtask,
+    )
 
 @dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_backup_time)
 async def handle_backup_time_input(message: Message):
@@ -2158,6 +1786,7 @@ async def main():
     # Запуск фоновых задач
     asyncio.create_task(schedule_sender())
     asyncio.create_task(periodic_save())
+    asyncio.create_task(periodic_cleanup())
     asyncio.create_task(forward_worker())
     asyncio.create_task(auto_backup_task())
 
@@ -2173,8 +1802,8 @@ async def main():
             logger.warning("Ошибка при закрытии сессии: %s", e)
 
         try:
-            save_users(user_store)
-            _save_cache_file()
+            await async_save_users(user_store)
+            await asyncio.to_thread(_save_cache_file)
             logger.info("💾 Все данные успешно сохранены на диск!")
         except Exception as e:
             logger.error("Критическая ошибка при финальном сохранении: %s", e)
