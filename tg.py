@@ -12,8 +12,6 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
-from collections import deque
-from aiohttp import ClientSession
 import tempfile
 import shutil
 import datetime
@@ -23,14 +21,17 @@ import logging
 import pickle
 import time  # used for cache timestamps
 from parser import parse_schedule_pretty, get_current_week_from_html, get_parser
-from collections import deque, OrderedDict, Counter, defaultdict
+from collections import OrderedDict, Counter, defaultdict
 
 # ----------------- CONFIG -----------------
-load_dotenv("/root/TGBOT/.env") # файл .env с записанным токеном, путь к файлу
+load_dotenv() # файл .env с токеном (ищется в cwd/родительских папках)
 TOKEN = os.getenv("RELEASE_TOKEN") # внутри .env RELEASE_TOKEN=токен бота
 PROXY_URL = os.getenv("PROXY_URL") # Загружаем прокси из .env
 BASE_URL = "https://lk.ks.psuti.ru/?mn=2&obj=218"
-BOT_OWNER_ID = int(os.getenv("OWNERID")) #ID ТГ Аккаунта
+_owner_id_raw = os.getenv("OWNERID", "").strip()
+if not _owner_id_raw.isdigit():
+    raise RuntimeError("OWNERID не задан или некорректен. Укажи числовой Telegram ID в .env")
+BOT_OWNER_ID = int(_owner_id_raw) #ID ТГ Аккаунта
 USER_FILE = "users.json" #Куда сохраняются пользователи
 GROUPS_FILE = "groups.json" #Где хранится список групп + курсы
 SELECTION_FILE = "selections.json" #Закешированный выбор юзеров
@@ -39,7 +40,6 @@ GLOBAL_BROADTASK = ""
 CURRENT_WK_CACHE: dict = {"wk": 0, "ts": 0.0}
 callback_cooldown = {}
 CALLBACK_DELAY = 1.0  # Настройка антифлуда на кнопки
-forward_queue = deque()
 user_message_cooldown = {}
 USER_DELAY = 1.0  # Антифлуд на сообщения от одного юзера
 LK_LIMIT_PER_HOST = 15 #Максимальное количество одновременных TCP-соединений
@@ -227,7 +227,7 @@ def load_json_file(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 
 def save_json_file(path: str, data: dict):
@@ -268,6 +268,9 @@ def save_users(users):
         if os.path.exists(tmp.name):
             os.unlink(tmp.name)
 
+async def async_save_users(users):
+    await asyncio.to_thread(save_users, users)
+
 # Инициализация хранилища
 user_store = load_users()
 user_store = {str(k): v for k, v in user_store.items()}
@@ -291,7 +294,7 @@ def register_user_from_message(msg):
     try:
         user = msg.from_user
         update_user_activity(user.id, user.username)
-    except:
+    except AttributeError:
         pass
 
 groups: dict[str, dict] = load_json_file(GROUPS_FILE)
@@ -300,10 +303,24 @@ async def periodic_save():
     while True:
         await asyncio.sleep(1200) # 20 минут
         try:
-            save_users(user_store)
+            await async_save_users(user_store)
             logger.info("💾 Автосохранение пользователей выполнено")
         except Exception as e:
             logger.error(f"❌ Ошибка при плановом сохранении: {e}")
+
+async def periodic_cleanup():
+    """Периодическая очистка in-memory структур от устаревших записей."""
+    while True:
+        try:
+            now = time.time()
+            callback_cooldown.clear()
+            stale_users = [uid for uid, ts in user_message_cooldown.items() if now - ts > 3600]
+            for uid in stale_users:
+                user_message_cooldown.pop(uid, None)
+            _clean_old_cache()
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка periodic_cleanup: {e}")
+        await asyncio.sleep(1800)
 # ----------------- SELECTION STORAGE -----------------
 def _load_cache_file():
     global _cache, CURRENT_WK_CACHE
@@ -392,6 +409,21 @@ def get_current_monday_ts() -> float:
     return monday_midnight.timestamp()
 
 def get_stats_text() -> str:
+    stats = collect_stats()
+    return (
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"⏱ <b>Время работы:</b> {stats['uptime_str']}\n"
+        f"📦 <b>Размер кеша:</b> {stats['cache_size']} стр.\n"
+        f"👥 <b>Всего юзеров:</b> {stats['total_users']}\n"
+        f"🏆 <b>Популярная группа:</b> {stats['most_popular_group']} ({stats['group_count']} чел.)\n"
+        f"📈 <b>Всего запросов:</b> {stats['total_reqs']}\n"
+        f"👤 <b>Последний активный:</b> {stats['last_use_text']}\n"
+        f"🔔 <b>Подключено рассылок:</b> {stats['active_schedules']}\n"
+        f"📨 <b>Рассылок отправлено сегодня:</b> {stats['today_sent']}\n"
+        f"⏰ <b>Последняя рассылка:</b> {stats['last_sent_text']}\n"
+    )
+
+def collect_stats() -> dict[str, str | int]:
     uptime_seconds = int(time.time() - START_TIME)
     uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
     cache_size = len(_cache)
@@ -420,18 +452,18 @@ def get_stats_text() -> str:
             if last_sent_info is None or info["last_sent_time"] > last_sent_info[1]:
                 last_sent_info = (info.get("username", "без ника"), info["last_sent_time"], uid_str)
     last_sent_text = f"@{last_sent_info[0]} в {last_sent_info[1]}" if last_sent_info else "Сегодня ещё не было"
-    return (
-        f"📊 <b>Статистика бота</b>\n\n"
-        f"⏱ <b>Время работы:</b> {uptime_str}\n"
-        f"📦 <b>Размер кеша:</b> {cache_size} стр.\n"
-        f"👥 <b>Всего юзеров:</b> {total_users}\n"
-        f"🏆 <b>Популярная группа:</b> {most_popular_group} ({group_count} чел.)\n"
-        f"📈 <b>Всего запросов:</b> {total_reqs}\n"
-        f"👤 <b>Последний активный:</b> {last_use_text}\n"
-        f"🔔 <b>Подключено рассылок:</b> {active_schedules}\n"
-        f"📨 <b>Рассылок отправлено сегодня:</b> {today_sent}\n"
-        f"⏰ <b>Последняя рассылка:</b> {last_sent_text}\n"
-    )
+    return {
+        "uptime_str": uptime_str,
+        "cache_size": cache_size,
+        "total_users": total_users,
+        "most_popular_group": most_popular_group,
+        "group_count": group_count,
+        "total_reqs": total_reqs,
+        "last_use_text": last_use_text,
+        "active_schedules": active_schedules,
+        "today_sent": today_sent,
+        "last_sent_text": last_sent_text,
+    }
 
 
 def get_users_list_text() -> str:
@@ -657,7 +689,7 @@ async def schedule_sender():
                         logger.error(f"❌ Рассылка {uid_int}: {e}")
 
             if sent_count > 0:
-                save_users(user_store)
+                await async_save_users(user_store)
                 logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count}")
 
         except Exception as e:
@@ -723,57 +755,6 @@ async def auto_backup_task():
             logger.error(f"❌ Ошибка в auto_backup_task: {e}")
             await asyncio.sleep(60)
 
-# ----------------- FETCH (basic) -----------------
-async def fetch_page(url: str, use_cache: bool = True) -> str:
-    global TOTAL_REQUESTS
-    TOTAL_REQUESTS += 1
-
-    cache_key = url
-    now = time.time()
-
-    # Проверка кеша
-    if use_cache and cache_key in _cache:
-        ts, html = _cache[cache_key]
-        if now - ts < CACHE_TTL_SECONDS:
-            logger.info(f"📦 [CACHE HIT] {url}")
-            return html
-
-    logger.info(f"🔎 [DIRECT FETCH] Запрос к ПГУТИ: {url}")
-
-    for attempt in range(1, 4):  # максимум 3 попытки
-        try:
-            async with _shared_session.get(url, timeout=35) as resp:  # увеличил таймаут
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise aiohttp.ClientResponseError(
-                        request_info=resp.request_info,
-                        history=resp.history,
-                        status=resp.status,
-                        message=f"HTTP {resp.status}: {text[:200]}"
-                    )
-                html = await resp.text()
-                
-                if len(html) < 1000:
-                    raise ValueError(f"Слишком короткий ответ: {len(html)} байт")
-
-                # Сохраняем в кеш
-                _cache[cache_key] = (now, html)
-                logger.info(f"✅ [FETCH OK] Страница загружена ({len(html)} байт, попытка {attempt})")
-                return html
-
-        except asyncio.TimeoutError:
-            logger.warning(f"⚠️ [FETCH TIMEOUT] Попытка {attempt}/3: {url}")
-        except aiohttp.ClientError as e:
-            logger.warning(f"⚠️ [FETCH ERROR] Попытка {attempt}/3: {type(e).__name__} - {e}")
-        except Exception as e:
-            logger.error(f"❌ [FETCH UNEXPECTED] Попытка {attempt}/3: {type(e).__name__} - {e}")
-
-        if attempt < 3:
-            await asyncio.sleep(1.5 * attempt)  # backoff
-
-    logger.error(f"❌ [FETCH FAILED] Не удалось загрузить {url} после 3 попыток")
-    return ""
-
 # ----------------- CACHE -----------------
 _cache: dict[str, tuple[float, str]] = {}
 _locks_per_url: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
@@ -823,7 +804,7 @@ async def get_current_wk() -> int:
 
             if wk > 0:
                 CURRENT_WK_CACHE = {"wk": wk, "ts": now}
-                _save_cache_file()
+                await asyncio.to_thread(_save_cache_file)
                 logger.info(f"✅ Определена неделя: {wk} (через {parser_name})")
                 return wk
             
@@ -877,12 +858,12 @@ async def get_cached_page(session: aiohttp.ClientSession, url: str, use_cache: b
         age = now - ts
 
         if age < CACHE_TTL_SECONDS:
-            logger.info(f"📦 [CACHE HIT] {url} (возраст {age:.0f} сек)")
+            logger.debug(f"📦 [CACHE HIT] {url} (возраст {age:.0f} сек)")
             return html
         else:
-            logger.info(f"📦 [CACHE EXPIRED] {url} — возраст {age:.0f} сек > {CACHE_TTL_SECONDS}")
+            logger.debug(f"📦 [CACHE EXPIRED] {url} — возраст {age:.0f} сек > {CACHE_TTL_SECONDS}")
 
-    logger.info(f"🔎 [FETCH] Запрос к ПГУТИ: {url}")
+    logger.debug(f"🔎 [FETCH] Запрос к ПГУТИ: {url}")
 
     # === ЗАГРУЗКА ===
     for attempt in range(1, 4):
@@ -904,7 +885,7 @@ async def get_cached_page(session: aiohttp.ClientSession, url: str, use_cache: b
 
                 # === УСПЕШНО — СОХРАНЯЕМ В КЭШ ===
                 _cache[cache_key] = (now, html)
-                logger.info(f"✅ [FETCH OK] Страница загружена ({len(html)} байт) и закэширована")
+                logger.debug(f"✅ [FETCH OK] Страница загружена ({len(html)} байт) и закэширована")
                 return html
 
         except Exception as e:
@@ -997,7 +978,7 @@ async def send_or_edit_text(text: str, chat_id: int):
     last_text_per_chat[chat_id] = text
 
 # ----------------- SHOW WEEK -----------------
-async def handle_show_week(message, wk, reply_message):
+async def handle_show_week(message, wk):
     chat_id = message.chat.id
     html = await get_cached_page(_shared_session, build_url_for_wk(wk, chat_id))
 
@@ -1150,7 +1131,7 @@ async def select_group(cb: CallbackQuery):
     wk = await get_current_wk()
     current_wk_per_chat[chat_id] = wk
 
-    await handle_show_week(cb.message, wk, cb.message)
+    await handle_show_week(cb.message, wk)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КОМАНД ====================
 
@@ -1218,7 +1199,7 @@ async def week_buttons(cb: CallbackQuery):
     # сохраняем выбранную неделю
     current_wk_per_chat[cb.message.chat.id] = wk
 
-    await handle_show_week(cb.message, wk, cb.message)
+    await handle_show_week(cb.message, wk)
 
 @dp.callback_query(F.data == "day_today")
 async def show_today(cb: CallbackQuery):
@@ -1316,59 +1297,7 @@ async def schedule_disable(cb: CallbackQuery):
 async def show_stats(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
-
-    # 1. Время работы бота
-    uptime_seconds = int(time.time() - START_TIME)
-    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
-
-    # 2. Размер кеша
-    cache_size = len(_cache)
-
-    # 3. Всего юзеров
-    total_users = len(user_store)
-
-    # 4. Популярная группа
-    if selected_group_per_chat:
-        most_popular_group, group_count = Counter(selected_group_per_chat.values()).most_common(1)[0]
-    else:
-        most_popular_group, group_count = "Нет данных", 0
-
-    # 5. Всего запросов
-    total_reqs = TOTAL_REQUESTS
-
-    # 6. Последний активный (исключая владельца)
-    last_user_name = "Нет данных"
-    last_time = 0
-    for uid_str, info in user_store.items():
-        if int(uid_str) == BOT_OWNER_ID:
-            continue
-        user_time = info.get("last_activity", 0)
-        if user_time > last_time:
-            last_time = user_time
-            last_user_name = info.get("username", "без_ника")
-    last_use_text = f"@{last_user_name} ({datetime.datetime.fromtimestamp(last_time).strftime('%d.%m.%Y %H:%M:%S')})" if last_time > 0 else "Никто еще не пользовался"
-
-    # 7. Активные рассылки
-    active_schedules = sum(1 for info in user_store.values() if "schedule_time" in info)
-
-    # === НОВОЕ ===
-    today_iso = datetime.date.today().isoformat()
-    today_sent = sum(1 for info in user_store.values() if info.get("last_sent_date") == today_iso)
-
-    # Последняя рассылка сегодня
-    last_sent_info = None
-    for uid_str, info in user_store.items():
-        if info.get("last_sent_date") == today_iso and "last_sent_time" in info:
-            if last_sent_info is None or info["last_sent_time"] > last_sent_info[1]:
-                last_sent_info = (info.get("username", "без ника"), info["last_sent_time"], uid_str)
-
-    if last_sent_info:
-        last_sent_text = f"@{last_sent_info[0]} в {last_sent_info[1]}"
-    else:
-        last_sent_text = "Сегодня ещё не было"
-
     text = get_stats_text()
-
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(Command("list_users"))
@@ -1381,15 +1310,6 @@ async def list_users(message: Message):
 async def schedule_list(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
-
-    lines = []
-    for uid_str, info in sorted(user_store.items(), key=lambda x: x[1].get("schedule_time", "99:99")):
-        if "schedule_time" in info:
-            username = info.get("username", "без ника")
-            group = selected_group_per_chat.get(int(uid_str), "не выбрана")
-            time = info["schedule_time"]
-            lines.append(f"• {uid_str} — @{username} → <b>{time}</b> (группа: {group})")
-
     text = get_schedule_list_text()
     if "<b>" in text:  # активные рассылки
         await message.answer(text, parse_mode=ParseMode.HTML)
@@ -1398,6 +1318,23 @@ async def schedule_list(message: Message):
 
 # словарь: user_id -> target_id (кому пересылать)
 active_supp: dict[int, int] = {}
+
+async def broadcast_to_all(source_chat_id: int, source_message_id: int) -> tuple[int, int]:
+    sent = 0
+    failed = 0
+    for uid in user_store:
+        user_id = int(uid)
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    return sent, failed
 
 @dp.message(Command("broadcast"))
 async def broadcast(message: Message):
@@ -1409,25 +1346,7 @@ async def broadcast(message: Message):
         return
 
     msg = message.reply_to_message
-
-    sent = 0
-    failed = 0
-
-    for uid in user_store:
-        user_id = int(uid)
-
-        try:
-            await bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id
-            )
-
-            sent += 1
-            await asyncio.sleep(0.05)
-
-        except Exception:
-            failed += 1
+    sent, failed = await broadcast_to_all(msg.chat.id, msg.message_id)
 
     await message.answer(
         f"📢 Рассылка завершена\n\n"
@@ -1693,14 +1612,7 @@ async def handle_broadcast_input(message: Message):
         await message.answer("Отменено.")
         return
 
-    sent = failed = 0
-    for uid in user_store:
-        try:
-            await bot.copy_message(chat_id=int(uid), from_chat_id=message.chat.id, message_id=message.message_id)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except:
-            failed += 1
+    sent, failed = await broadcast_to_all(message.chat.id, message.message_id)
     waiting_for_broadcast.discard(chat_id)
     await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
                                 message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
@@ -1719,7 +1631,7 @@ async def handle_supp_id_input(message: Message):
         return
     try:
         target_id = int(text)
-    except:
+    except ValueError:
         await message.answer("Неверный ID, попробуйте снова или отмена.")
         return
     target_str = str(target_id)
@@ -2158,6 +2070,7 @@ async def main():
     # Запуск фоновых задач
     asyncio.create_task(schedule_sender())
     asyncio.create_task(periodic_save())
+    asyncio.create_task(periodic_cleanup())
     asyncio.create_task(forward_worker())
     asyncio.create_task(auto_backup_task())
 
@@ -2173,8 +2086,8 @@ async def main():
             logger.warning("Ошибка при закрытии сессии: %s", e)
 
         try:
-            save_users(user_store)
-            _save_cache_file()
+            await async_save_users(user_store)
+            await asyncio.to_thread(_save_cache_file)
             logger.info("💾 Все данные успешно сохранены на диск!")
         except Exception as e:
             logger.error("Критическая ошибка при финальном сохранении: %s", e)
