@@ -271,6 +271,9 @@ def save_users(users):
 async def async_save_users(users):
     await async_save_users_to_file(users, USER_FILE, logger)
 
+async def async_save_users(users):
+    await asyncio.to_thread(save_users, users)
+
 # Инициализация хранилища
 user_store = load_users()
 user_store = {str(k): v for k, v in user_store.items()}
